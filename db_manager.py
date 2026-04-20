@@ -230,6 +230,7 @@ class DBManager:
                 order_status TEXT DEFAULT 'unknown',
                 cookie_id TEXT,
                 is_bargain INTEGER DEFAULT 0,
+                system_shipped INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
@@ -275,6 +276,14 @@ class DBManager:
                 logger.info("正在为 orders 表添加 version 列...")
                 self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN version INTEGER DEFAULT 1")
                 logger.info("orders 表 version 列添加完成")
+
+            # 检查并添加 system_shipped 列（用于标记系统已自动发货）
+            try:
+                self._execute_sql(cursor, "SELECT system_shipped FROM orders LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 orders 表添加 system_shipped 列...")
+                self._execute_sql(cursor, "ALTER TABLE orders ADD COLUMN system_shipped INTEGER DEFAULT 0")
+                logger.info("orders 表 system_shipped 列添加完成")
 
             # 检查并添加 chat_id 列到 orders 表（用于手动发货时发送消息）
             try:
@@ -346,15 +355,36 @@ class DBManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 keyword TEXT NOT NULL,
                 card_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
                 delivery_count INTEGER DEFAULT 1,
                 enabled BOOLEAN DEFAULT TRUE,
                 description TEXT,
                 delivery_times INTEGER DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
+                FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
             )
             ''')
+
+            # 检查并添加 user_id 列（用于发货规则多用户隔离）
+            try:
+                self._execute_sql(cursor, "SELECT user_id FROM delivery_rules LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 delivery_rules 表添加 user_id 列...")
+                self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN user_id INTEGER")
+                logger.info("delivery_rules 表 user_id 列添加完成")
+
+            cursor.execute("SELECT id FROM users ORDER BY id LIMIT 1")
+            first_user = cursor.fetchone()
+            if first_user:
+                self._execute_sql(
+                    cursor,
+                    "UPDATE delivery_rules SET user_id = ? WHERE user_id IS NULL",
+                    (first_user[0],)
+                )
+
+            self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_rules_user_id ON delivery_rules(user_id)")
 
             # 创建默认回复表
             cursor.execute('''
@@ -4474,13 +4504,14 @@ class DBManager:
                         return False
 
                 # 检查订单是否已存在
-                cursor.execute("SELECT order_id FROM orders WHERE order_id = ?", (order_id,))
+                cursor.execute("SELECT order_id, order_status FROM orders WHERE order_id = ?", (order_id,))
                 existing = cursor.fetchone()
 
                 if existing:
                     # 更新现有订单
                     update_fields = []
                     update_values = []
+                    existing_order_status = existing[1] if len(existing) > 1 else None
 
                     if item_id is not None:
                         update_fields.append("item_id = ?")
@@ -4501,8 +4532,14 @@ class DBManager:
                         update_fields.append("amount = ?")
                         update_values.append(amount)
                     if order_status is not None:
-                        update_fields.append("order_status = ?")
-                        update_values.append(order_status)
+                        normalized_order_status = order_status.strip() if isinstance(order_status, str) else order_status
+                        if normalized_order_status in ("", None):
+                            logger.info(f"订单 {order_id} 收到空订单状态，跳过状态更新")
+                        elif normalized_order_status == 'unknown' and existing_order_status and existing_order_status != 'unknown':
+                            logger.info(f"订单 {order_id} 当前状态为 {existing_order_status}，忽略 unknown 状态回写")
+                        else:
+                            update_fields.append("order_status = ?")
+                            update_values.append(normalized_order_status)
                     if cookie_id is not None:
                         update_fields.append("cookie_id = ?")
                         update_values.append(cookie_id)

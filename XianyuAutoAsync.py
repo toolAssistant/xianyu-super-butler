@@ -1,6 +1,7 @@
 import asyncio
 import json
 import re
+import ssl
 import time
 import base64
 import os
@@ -23,6 +24,11 @@ import sys
 import aiohttp
 from collections import defaultdict
 from db_manager import db_manager
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 # 滑块验证补丁已废弃，使用集成的 Playwright 登录方法
 # 不再需要猴子补丁，所有功能已集成到 XianyuSliderStealth 类中
@@ -517,11 +523,25 @@ class XianyuLive:
             if expired_confirms:
                 cleaned_total += len(expired_confirms)
                 logger.warning(f"【{self.cookie_id}】清理了 {len(expired_confirms)} 个过期订单确认记录")
+
+            expired_freeshipping = [
+                order_id for order_id, last_time in self.freeshipping_orders.items()
+                if current_time - last_time > max_confirm_age
+            ]
+            for order_id in expired_freeshipping:
+                del self.freeshipping_orders[order_id]
+            if expired_freeshipping:
+                cleaned_total += len(expired_freeshipping)
+                logger.warning(f"【{self.cookie_id}】清理了 {len(expired_freeshipping)} 个过期免拼处理记录")
             
             # 只有实际清理了内容才记录总数日志
             if cleaned_total > 0:
                 logger.info(f"【{self.cookie_id}】实例缓存清理完成，共清理 {cleaned_total} 条记录")
-                logger.warning(f"【{self.cookie_id}】当前缓存数量 - 通知: {len(self.last_notification_time)}, 发货: {len(self.last_delivery_time)}, 确认: {len(self.confirmed_orders)}")
+                logger.warning(
+                    f"【{self.cookie_id}】当前缓存数量 - 通知: {len(self.last_notification_time)}, "
+                    f"发货: {len(self.last_delivery_time)}, 确认: {len(self.confirmed_orders)}, "
+                    f"免拼: {len(self.freeshipping_orders)}"
+                )
         
         except Exception as e:
             logger.error(f"【{self.cookie_id}】清理实例缓存时出错: {self._safe_str(e)}")
@@ -692,10 +712,15 @@ class XianyuLive:
         self.confirmed_orders = {}  # 记录已确认发货的订单，防止重复确认
         self.order_confirm_cooldown = 600  # 10分钟内不重复确认同一订单
 
+        # 小刀/团购免拼处理防重复机制
+        self.freeshipping_orders = {}  # 记录已完成免拼处理的订单，避免短时间内重复调用
+        self.freeshipping_cooldown = 600  # 10分钟内不重复执行同一订单的免拼处理
+
         # 自动发货已发送订单记录
         self.delivery_sent_orders = set()  # 记录已发货的订单ID，防止重复发货
 
         self.session = None  # 用于API调用的aiohttp session
+        self.ssl_context = self._build_ssl_context()
 
         # 启动定期清理过期暂停记录的任务
         self.cleanup_task = None
@@ -763,6 +788,16 @@ class XianyuLive:
 
         # 注册实例到类级别字典（用于API调用）
         self._register_instance()
+
+    def _build_ssl_context(self):
+        """构建统一的SSL上下文，优先使用certifi证书链。"""
+        try:
+            if certifi:
+                return ssl.create_default_context(cafile=certifi.where())
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】加载certifi证书链失败，回退系统默认证书: {self._safe_str(e)}")
+
+        return ssl.create_default_context()
 
     def _init_order_status_handler(self):
         """初始化订单状态处理器"""
@@ -844,6 +879,7 @@ class XianyuLive:
     def mark_delivery_sent(self, order_id: str):
         """标记订单已发货"""
         self.delivery_sent_orders.add(order_id)
+        self.last_delivery_time[order_id] = time.time()
         logger.info(f"【{self.cookie_id}】订单 {order_id} 已标记为发货")
         
         # 更新订单状态为已发货
@@ -867,6 +903,104 @@ class XianyuLive:
                 logger.error(f"【{self.cookie_id}】详细错误信息: {traceback.format_exc()}")
         else:
             logger.warning(f"【{self.cookie_id}】订单状态处理器为None，跳过自动发货状态更新: {order_id}")
+
+    def _sync_runtime_cookies(self, new_cookies_str: str = None):
+        """同步运行时Cookie到实例和当前aiohttp session。"""
+        try:
+            if new_cookies_str is not None:
+                self.cookies_str = new_cookies_str
+
+            self.cookies = trans_cookies(self.cookies_str) if self.cookies_str else {}
+
+            if self.session and not self.session.closed:
+                self.session.headers['cookie'] = self.cookies_str or ''
+                logger.info(f"【{self.cookie_id}】已同步运行时Cookie到aiohttp session")
+
+            return True
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】同步运行时Cookie失败: {self._safe_str(e)}")
+            return False
+
+    def _record_platform_shipment_confirmation(self, order_id: str, confirmed_at: float = None):
+        """记录平台侧已确认发货，供后续自动发货流程复用。"""
+        if not order_id:
+            return
+
+        confirm_time = confirmed_at or time.time()
+        self.confirmed_orders[order_id] = confirm_time
+        logger.info(f"【{self.cookie_id}】订单 {order_id} 已记录平台确认发货时间")
+
+    def _record_bargain_freeshipping(self, order_id: str, processed_at: float = None):
+        """记录订单已完成免拼处理。"""
+        if not order_id:
+            return
+
+        process_time = processed_at or time.time()
+        self.freeshipping_orders[order_id] = process_time
+        logger.info(f"【{self.cookie_id}】订单 {order_id} 已记录免拼处理时间")
+
+    def _has_recent_bargain_freeshipping(self, order_id: str) -> bool:
+        """检查订单是否处于免拼处理冷却期。"""
+        if not order_id:
+            return False
+
+        last_processed = self.freeshipping_orders.get(order_id, 0)
+        return bool(last_processed and time.time() - last_processed < self.freeshipping_cooldown)
+
+    def _has_recent_delivery_activity(self, order_id: str) -> bool:
+        """判断订单近期是否已经发送过卡密，用于晚到的确认发货结果补状态。"""
+        if not order_id:
+            return False
+
+        if order_id in self.delivery_sent_orders:
+            return True
+
+        if self.is_lock_held(order_id):
+            return True
+
+        last_delivery = self.last_delivery_time.get(order_id, 0)
+        if last_delivery and time.time() - last_delivery < self.delivery_cooldown:
+            return True
+
+        return False
+
+    def _mark_order_delivery_completed(self, order_id: str, chat_id: str = None):
+        """将订单在本地统一标记为已发货。"""
+        if not order_id:
+            return
+
+        self.mark_delivery_sent(order_id)
+
+        try:
+            from db_manager import db_manager
+            db_manager.insert_or_update_order(
+                order_id=order_id,
+                order_status='shipped',
+                system_shipped=True,
+                chat_id=chat_id
+            )
+            logger.info(f'【{self.cookie_id}】✅ 订单 {order_id} 已统一标记为已发货 (shipped/system_shipped=1)')
+        except Exception as db_e:
+            logger.error(f'【{self.cookie_id}】❌ 更新订单已发货状态失败: {self._safe_str(db_e)}')
+
+    def _hold_delivery_lock(self, lock_key: str, delay_minutes: int = 10):
+        """在自动发货后短暂持有订单锁，避免短时间内重复发货"""
+        self.last_delivery_time[lock_key] = time.time()
+
+        previous_lock = self._lock_hold_info.get(lock_key)
+        previous_task = previous_lock.get('task') if previous_lock else None
+        if previous_task and not previous_task.done():
+            previous_task.cancel()
+
+        self._lock_hold_info[lock_key] = {
+            'locked': True,
+            'lock_time': time.time(),
+            'release_time': None,
+            'task': None
+        }
+
+        delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=delay_minutes))
+        self._lock_hold_info[lock_key]['task'] = delay_task
 
     async def _delayed_lock_release(self, lock_key: str, delay_minutes: int = 10):
         """
@@ -978,6 +1112,7 @@ class XianyuLive:
             # 系统消息
             '[我已付款，等待你发货]',
             '[已付款，待发货]',
+            '已付款，待发货',
             '我已付款，等待你发货',
             '[记得及时发货]',
         ]
@@ -1203,16 +1338,21 @@ class XianyuLive:
                         logger.info(f"无订单ID，发送单个卡券")
 
                     # 多次调用自动发货方法，每次获取不同的内容
-                    delivery_contents = []
+                    delivery_results = []
                     success_count = 0
+                    confirm_failure_reasons = []
 
                     for i in range(quantity_to_send):
                         try:
                             # 每次调用都可能获取不同的内容（API卡券、批量数据等）
-                            delivery_content = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
+                            delivery_result = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
+                            if delivery_result and delivery_result.get('content'):
+                                delivery_results.append(delivery_result)
                                 success_count += 1
+                                if not delivery_result.get('platform_shipment_confirmed'):
+                                    confirm_failure_reasons.append(
+                                        delivery_result.get('confirm_error') or '自动确认发货未成功'
+                                    )
                                 if quantity_to_send > 1:
                                     logger.info(f"第 {i+1}/{quantity_to_send} 个卡券内容获取成功")
                             else:
@@ -1220,34 +1360,9 @@ class XianyuLive:
                         except Exception as e:
                             logger.error(f"第 {i+1}/{quantity_to_send} 个卡券获取异常: {self._safe_str(e)}")
 
-                    if delivery_contents:
-                        # 标记已发货（防重复）- 基于订单ID
-                        self.mark_delivery_sent(order_id)
-
-                        # 更新订单数据库，标记系统已发货
-                        if order_id:
-                            try:
-                                from db_manager import db_manager
-                                db_manager.insert_or_update_order(
-                                    order_id=order_id,
-                                    system_shipped=True,
-                                    chat_id=chat_id
-                                )
-                                logger.info(f'【{self.cookie_id}】✅ 订单 {order_id} 已标记为系统已发货 (system_shipped=1)')
-                            except Exception as db_e:
-                                logger.error(f'【{self.cookie_id}】❌ 更新订单system_shipped状态失败: {self._safe_str(db_e)}')
-
-                        # 标记锁为持有状态，并启动延迟释放任务
-                        self._lock_hold_info[lock_key] = {
-                            'locked': True,
-                            'lock_time': time.time(),
-                            'release_time': None,
-                            'task': None
-                        }
-
-                        # 启动延迟释放锁的异步任务（10分钟后释放）
-                        delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
-                        self._lock_hold_info[lock_key]['task'] = delay_task
+                    if delivery_results:
+                        delivery_contents = [result['content'] for result in delivery_results]
+                        sent_count = 0
 
                         # 发送所有获取到的发货内容
                         for i, delivery_content in enumerate(delivery_contents):
@@ -1291,14 +1406,50 @@ class XianyuLive:
                                     if len(delivery_contents) > 1 and i < len(delivery_contents) - 1:
                                         await asyncio.sleep(1)
 
+                                sent_count += 1
                             except Exception as e:
                                 logger.error(f"发送第 {i+1} 条消息失败: {self._safe_str(e)}")
 
-                        # 发送成功通知
-                        if len(delivery_contents) > 1:
+                        if sent_count > 0:
+                            self._hold_delivery_lock(lock_key, delay_minutes=10)
+
+                        platform_shipment_confirmed = any(
+                            result.get('platform_shipment_confirmed', False) for result in delivery_results
+                        )
+                        all_messages_sent = sent_count == len(delivery_contents)
+
+                        if platform_shipment_confirmed and all_messages_sent and order_id:
+                            self._mark_order_delivery_completed(order_id, chat_id)
+                        elif sent_count > 0 and not platform_shipment_confirmed:
+                            confirm_error = '；'.join(dict.fromkeys(confirm_failure_reasons))
+                            logger.warning(
+                                f'【{self.cookie_id}】⚠️ 订单 {order_id} 卡密已发送，但闲鱼确认发货未成功: {confirm_error}'
+                            )
+
+                        # 发送结果通知
+                        if platform_shipment_confirmed and all_messages_sent and len(delivery_contents) > 1:
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
-                        else:
+                        elif platform_shipment_confirmed and all_messages_sent:
                             await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                        elif sent_count > 0 and not platform_shipment_confirmed:
+                            confirm_error = '；'.join(dict.fromkeys(confirm_failure_reasons))
+                            await self.send_delivery_failure_notification(
+                                send_user_name,
+                                send_user_id,
+                                item_id,
+                                f"卡密已发送，但闲鱼订单仍是去发货：{confirm_error}",
+                                chat_id
+                            )
+                        elif sent_count > 0:
+                            await self.send_delivery_failure_notification(
+                                send_user_name,
+                                send_user_id,
+                                item_id,
+                                f"卡密已发送 {sent_count}/{len(delivery_contents)} 条，但存在发送失败",
+                                chat_id
+                            )
+                        else:
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "卡密发送失败", chat_id)
                     else:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         # 发送自动发货失败通知
@@ -1365,9 +1516,7 @@ class XianyuLive:
                     new_cookies_str = account_info.get('cookie_value')
                     if new_cookies_str != self.cookies_str:
                         logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                        self.cookies_str = new_cookies_str
-                        # 更新cookies字典
-                        self.cookies = trans_cookies(self.cookies_str)
+                        self._sync_runtime_cookies(new_cookies_str)
                         logger.warning(f"【{self.cookie_id}】Cookie已从数据库重新加载")
             except Exception as reload_e:
                 logger.warning(f"【{self.cookie_id}】从数据库重新加载cookie失败，继续使用当前cookie: {self._safe_str(reload_e)}")
@@ -1477,7 +1626,8 @@ class XianyuLive:
             logger.info(f"【{self.cookie_id}】  完整Cookie字符串长度: {len(self.cookies_str)}")
             logger.info(f"【{self.cookie_id}】==========================================")
 
-            async with aiohttp.ClientSession() as session:
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+            async with aiohttp.ClientSession(connector=connector) as session:
                 async with session.post(
                     api_url,
                     params=params,
@@ -1507,6 +1657,7 @@ class XianyuLive:
                             self.cookies.update(new_cookies)
                             # 生成新的cookie字符串
                             self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                            self._sync_runtime_cookies(self.cookies_str)
                             # 更新数据库中的Cookie
                             await self.update_config_cookies()
                             logger.warning("已更新Cookie到数据库")
@@ -1828,6 +1979,7 @@ class XianyuLive:
                         # 更新当前实例的cookies（使用合并后的cookies）
                         self.cookies_str = cookies_str
                         self.cookies = updated_cookies
+                        self._sync_runtime_cookies(self.cookies_str)
 
                         # 更新数据库中的cookies
                         await self.update_config_cookies()
@@ -1851,6 +2003,7 @@ class XianyuLive:
                         # 回滚cookies
                         self.cookies_str = old_cookies_str
                         self.cookies = old_cookies_dict
+                        self._sync_runtime_cookies(self.cookies_str)
 
                         # 记录更新失败到日志文件，包含获取到的x5 cookies
                         x5sec_cookies_str = "; ".join([f"{k}={v}" for k, v in x5sec_cookies.items()]) if x5sec_cookies else "无"
@@ -2022,6 +2175,7 @@ class XianyuLive:
                 # 更新当前实例的cookies
                 self.cookies_str = new_cookies_str
                 self.cookies = new_cookies_dict
+                self._sync_runtime_cookies(self.cookies_str)
 
                 # 更新数据库中的cookies
                 await self.update_config_cookies()
@@ -2043,6 +2197,7 @@ class XianyuLive:
                 try:
                     self.cookies_str = old_cookies_str
                     self.cookies = old_cookies_dict
+                    self._sync_runtime_cookies(self.cookies_str)
                     await self.update_config_cookies()
                     logger.info(f"【{self.cookie_id}】cookies已回滚到原始状态")
                 except Exception as rollback_e:
@@ -2133,8 +2288,7 @@ class XianyuLive:
             db_cookie_value = account_info.get('cookie_value', '')
             if db_cookie_value and db_cookie_value != self.cookies_str:
                 logger.info(f"【{self.cookie_id}】检测到数据库中的cookie已更新，重新加载cookie")
-                self.cookies_str = db_cookie_value
-                self.cookies = trans_cookies(self.cookies_str)
+                self._sync_runtime_cookies(db_cookie_value)
                 logger.info(f"【{self.cookie_id}】Cookie已从数据库重新加载，跳过密码登录刷新")
                 return True
             
@@ -2988,6 +3142,7 @@ class XianyuLive:
                         self.cookies.update(new_cookies)
                         # 生成新的cookie字符串
                         self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                        self._sync_runtime_cookies(self.cookies_str)
                         # 更新数据库中的Cookie
                         await self.update_config_cookies()
                         logger.warning("已更新Cookie到数据库")
@@ -4290,6 +4445,59 @@ class XianyuLive:
 
         return False
 
+    def _is_shipment_session_invalid(self, error_message: str) -> bool:
+        """判断发货确认接口是否因为会话或令牌失效而失败。"""
+        if not error_message:
+            return False
+
+        invalid_keywords = [
+            'FAIL_SYS_SESSION_EXPIRED',
+            'Session过期',
+            'FAIL_SYS_TOKEN_EXOIRED',
+            'FAIL_SYS_TOKEN_EXPIRED',
+            '令牌过期',
+        ]
+        return any(keyword in error_message for keyword in invalid_keywords)
+
+    async def _reload_cookies_from_db_if_changed(self) -> bool:
+        """如果数据库中的Cookie已更新，则重新加载到当前实例。"""
+        try:
+            from db_manager import db_manager
+
+            account_info = db_manager.get_cookie_details(self.cookie_id)
+            db_cookies_str = account_info.get('cookie_value') if account_info else None
+            if db_cookies_str and db_cookies_str != self.cookies_str:
+                logger.warning(f"【{self.cookie_id}】检测到数据库中存在更新后的Cookie，重新加载到当前实例")
+                self._sync_runtime_cookies(db_cookies_str)
+                return True
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】从数据库重新加载Cookie失败: {self._safe_str(e)}")
+
+        return False
+
+    async def _recover_shipment_session(self, trigger_source: str, error_message: str) -> bool:
+        """发货确认接口会话失效后的自恢复逻辑。"""
+        logger.warning(
+            f"【{self.cookie_id}】{trigger_source}检测到会话失效，开始自动恢复: {error_message}"
+        )
+
+        async with self.cookie_refresh_lock:
+            if await self._reload_cookies_from_db_if_changed():
+                logger.warning(f"【{self.cookie_id}】已通过数据库中的最新Cookie恢复发货会话")
+                return True
+
+            refresh_success = await self._refresh_cookies_via_browser(
+                triggered_by_refresh_token=False,
+                ignore_qr_cooldown=True
+            )
+            if refresh_success:
+                self._sync_runtime_cookies()
+                logger.warning(f"【{self.cookie_id}】已通过浏览器刷新恢复发货会话")
+                return True
+
+        logger.error(f"【{self.cookie_id}】{trigger_source}会话自动恢复失败")
+        return False
+
     async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
         """发送自动发货失败通知"""
         try:
@@ -4358,6 +4566,9 @@ class XianyuLive:
         try:
             logger.warning(f"【{self.cookie_id}】开始确认发货，订单ID: {order_id}")
 
+            if not self.session or self.session.closed:
+                await self.create_session()
+
             # 导入解密后的确认发货模块
             from secure_confirm_decrypted import SecureConfirm
 
@@ -4374,14 +4585,24 @@ class XianyuLive:
 
             # 同步更新后的cookies和token
             if secure_confirm.cookies_str != self.cookies_str:
-                self.cookies_str = secure_confirm.cookies_str
-                self.cookies = secure_confirm.cookies
+                self._sync_runtime_cookies(secure_confirm.cookies_str)
                 logger.warning(f"【{self.cookie_id}】已同步确认发货模块更新的cookies")
 
             if secure_confirm.current_token != self.current_token:
                 self.current_token = secure_confirm.current_token
                 self.last_token_refresh_time = secure_confirm.last_token_refresh_time
                 logger.warning(f"【{self.cookie_id}】已同步确认发货模块更新的token")
+
+            if (
+                isinstance(result, dict)
+                and not result.get('success')
+                and self._is_shipment_session_invalid(result.get('error', ''))
+                and retry_count < 1
+            ):
+                recovered = await self._recover_shipment_session("自动确认发货", result.get('error', ''))
+                if recovered:
+                    logger.warning(f"【{self.cookie_id}】自动确认发货会话恢复成功，开始重试订单 {order_id}")
+                    return await self.auto_confirm(order_id, item_id, retry_count + 1)
 
             return result
 
@@ -4393,6 +4614,9 @@ class XianyuLive:
         """自动免拼发货 - 使用解密模块"""
         try:
             logger.warning(f"【{self.cookie_id}】开始免拼发货，订单ID: {order_id}")
+
+            if not self.session or self.session.closed:
+                await self.create_session()
 
             # 导入解密后的免拼发货模块
             from secure_freeshipping_decrypted import SecureFreeshipping
@@ -4406,7 +4630,24 @@ class XianyuLive:
             secure_freeshipping.token_refresh_interval = self.token_refresh_interval
 
             # 调用免拼发货方法
-            return await secure_freeshipping.auto_freeshipping(order_id, item_id, buyer_id, retry_count)
+            result = await secure_freeshipping.auto_freeshipping(order_id, item_id, buyer_id, retry_count)
+
+            if secure_freeshipping.cookies_str != self.cookies_str:
+                self._sync_runtime_cookies(secure_freeshipping.cookies_str)
+                logger.warning(f"【{self.cookie_id}】已同步免拼发货模块更新的cookies")
+
+            if (
+                isinstance(result, dict)
+                and not result.get('success')
+                and self._is_shipment_session_invalid(result.get('error', ''))
+                and retry_count < 1
+            ):
+                recovered = await self._recover_shipment_session("自动免拼发货", result.get('error', ''))
+                if recovered:
+                    logger.warning(f"【{self.cookie_id}】自动免拼发货会话恢复成功，开始重试订单 {order_id}")
+                    return await self.auto_freeshipping(order_id, item_id, buyer_id, retry_count + 1)
+
+            return result
 
         except Exception as e:
             logger.error(f"【{self.cookie_id}】免拼发货模块调用失败: {self._safe_str(e)}")
@@ -4483,6 +4724,12 @@ class XianyuLive:
                         if not cookie_info:
                             logger.warning(f"Cookie ID {self.cookie_id} 不存在于cookies表中，丢弃订单 {order_id}")
                         else:
+                            fetched_order_status = result.get('order_status')
+                            if isinstance(fetched_order_status, str):
+                                fetched_order_status = fetched_order_status.strip()
+                            if not fetched_order_status or fetched_order_status == 'unknown':
+                                fetched_order_status = None
+
                             # 先保存订单基本信息（包含时间和收货人信息）
                             success = db_manager.insert_or_update_order(
                                 order_id=order_id,
@@ -4492,7 +4739,7 @@ class XianyuLive:
                                 spec_value=spec_value,
                                 quantity=quantity,
                                 amount=amount,
-                                order_status=result.get('order_status'),  # 添加订单状态
+                                order_status=fetched_order_status,
                                 cookie_id=self.cookie_id,
                                 created_at=order_time,
                                 receiver_name=receiver_name,
@@ -4545,6 +4792,9 @@ class XianyuLive:
         """自动发货功能 - 获取卡券规则，执行延时，确认发货，发送内容"""
         try:
             from db_manager import db_manager
+
+            platform_shipment_confirmed = False
+            confirm_error = None
 
             logger.info(f"开始自动发货检查: 商品ID={item_id}")
 
@@ -4722,11 +4972,15 @@ class XianyuLive:
                 await asyncio.sleep(delay_seconds)
                 logger.info(f"延时完成")
 
+            order_info = db_manager.get_order_by_id(order_id) if order_id else None
+            is_bargain_order = bool(order_info.get('is_bargain')) if order_info else False
+
             # 如果有订单ID，执行确认发货
             if order_id:
                 # 检查是否启用自动确认发货
                 if not self.is_auto_confirm_enabled():
                     logger.info(f"自动确认发货已关闭，跳过订单 {order_id}")
+                    confirm_error = "自动确认发货已关闭"
                 else:
                     # 检查确认发货冷却时间
                     current_time = time.time()
@@ -4739,14 +4993,56 @@ class XianyuLive:
                             should_confirm = False
 
                     if should_confirm:
-                        logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
-                        confirm_result = await self.auto_confirm(order_id, item_id)
-                        if confirm_result.get('success'):
-                            self.confirmed_orders[order_id] = current_time
-                            logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
+                        confirm_result = None
+                        freeshipping_error = None
+
+                        if is_bargain_order and item_id and send_user_id:
+                            if self._has_recent_bargain_freeshipping(order_id):
+                                logger.info(
+                                    f"订单 {order_id} 已在 {self.freeshipping_cooldown} 秒内完成过免拼处理，"
+                                    f"跳过重复免拼，直接确认发货"
+                                )
+                            else:
+                                logger.info(f"开始自动免拼处理: 订单ID={order_id}, 商品ID={item_id}, 买家ID={send_user_id}")
+                                freeshipping_result = await self.auto_freeshipping(order_id, item_id, send_user_id)
+                                if freeshipping_result.get('success'):
+                                    self._record_bargain_freeshipping(order_id, current_time)
+                                    logger.info(f"✅ 订单 {order_id} 免拼处理成功，继续执行普通确认发货")
+                                else:
+                                    freeshipping_error = freeshipping_result.get('error', '未知错误')
+                                    logger.warning(
+                                        f"⚠️ 订单 {order_id} 免拼处理失败: {freeshipping_error}，"
+                                        f"继续尝试普通确认发货"
+                                    )
+
+                            logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
+                            confirm_result = await self.auto_confirm(order_id, item_id)
                         else:
-                            logger.warning(f"⚠️ 自动确认发货失败: {confirm_result.get('error', '未知错误')}")
+                            if is_bargain_order:
+                                logger.warning(
+                                    f"订单 {order_id} 已标记为小刀订单，但缺少item_id或buyer_id，回退到普通确认发货"
+                                )
+                            logger.info(f"开始自动确认发货: 订单ID={order_id}, 商品ID={item_id}")
+                            confirm_result = await self.auto_confirm(order_id, item_id)
+
+                        if confirm_result.get('success'):
+                            self._record_platform_shipment_confirmation(order_id, current_time)
+                            platform_shipment_confirmed = True
+                            if is_bargain_order and item_id and send_user_id:
+                                logger.info(f"🎉 小刀订单确认发货成功！订单ID: {order_id}")
+                            else:
+                                logger.info(f"🎉 自动确认发货成功！订单ID: {order_id}")
+                        else:
+                            confirm_error = confirm_result.get('error', '未知错误')
+                            if is_bargain_order and item_id and send_user_id:
+                                if freeshipping_error:
+                                    confirm_error = f"免拼处理失败: {freeshipping_error}；确认发货失败: {confirm_error}"
+                                logger.warning(f"⚠️ 小刀订单确认发货失败: {confirm_error}")
+                            else:
+                                logger.warning(f"⚠️ 自动确认发货失败: {confirm_error}")
                             # 即使确认发货失败，也继续发送发货内容
+                    else:
+                        platform_shipment_confirmed = True
 
             # 检查是否存在订单ID，只有存在订单ID才处理发货内容
             if order_id:
@@ -4820,7 +5116,11 @@ class XianyuLive:
                     # 增加发货次数统计
                     db_manager.increment_delivery_times(rule['id'])
                     logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
-                    return final_content
+                    return {
+                        'content': final_content,
+                        'platform_shipment_confirmed': platform_shipment_confirmed,
+                        'confirm_error': confirm_error
+                    }
                 else:
                     logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
                     return None
@@ -6040,8 +6340,7 @@ class XianyuLive:
 
                 # 如果当前实例的cookie_id匹配，更新实例的cookie信息
                 if target_cookie_id == self.cookie_id:
-                    self.cookies = real_cookies_dict
-                    self.cookies_str = real_cookies_str
+                    self._sync_runtime_cookies(real_cookies_str)
                     logger.info(f"【{target_cookie_id}】已更新当前实例的Cookie信息")
 
                 # 更新扫码登录Cookie刷新时间标志
@@ -6394,11 +6693,16 @@ class XianyuLive:
         remaining_time = max(0, self.qr_cookie_refresh_cooldown - time_since_qr_refresh)
         return int(remaining_time)
 
-    async def _refresh_cookies_via_browser(self, triggered_by_refresh_token: bool = False):
+    async def _refresh_cookies_via_browser(
+        self,
+        triggered_by_refresh_token: bool = False,
+        ignore_qr_cooldown: bool = False
+    ):
         """通过浏览器访问指定页面刷新Cookie
 
         Args:
             triggered_by_refresh_token: 是否由refresh_token方法触发，如果是True则设置browser_cookie_refreshed标志
+            ignore_qr_cooldown: 是否忽略扫码登录后的冷却时间限制
         """
 
 
@@ -6412,7 +6716,7 @@ class XianyuLive:
             current_time = time.time()
             time_since_qr_refresh = current_time - self.last_qr_cookie_refresh_time
 
-            if time_since_qr_refresh < self.qr_cookie_refresh_cooldown:
+            if not ignore_qr_cooldown and time_since_qr_refresh < self.qr_cookie_refresh_cooldown:
                 remaining_time = self.qr_cookie_refresh_cooldown - time_since_qr_refresh
                 remaining_minutes = int(remaining_time // 60)
                 remaining_seconds = int(remaining_time % 60)
@@ -6420,6 +6724,8 @@ class XianyuLive:
                 logger.info(f"【{self.cookie_id}】扫码登录Cookie刷新冷却中，还需等待 {remaining_minutes}分{remaining_seconds}秒")
                 logger.info(f"【{self.cookie_id}】跳过本次浏览器Cookie刷新")
                 return False
+            if ignore_qr_cooldown:
+                logger.info(f"【{self.cookie_id}】本次浏览器Cookie刷新忽略扫码冷却时间限制")
 
             logger.info(f"【{self.cookie_id}】开始通过浏览器刷新Cookie...")
             logger.info(f"【{self.cookie_id}】刷新前Cookie长度: {len(self.cookies_str)}")
@@ -6643,6 +6949,7 @@ class XianyuLive:
             # 更新self.cookies和cookies_str
             self.cookies.update(new_cookies_dict)
             self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+            self._sync_runtime_cookies(self.cookies_str)
 
             logger.info(f"【{self.cookie_id}】Cookie已更新，包含 {len(new_cookies_dict)} 个字段")
 
@@ -6863,7 +7170,8 @@ class XianyuLive:
         try:
             async with websockets.connect(
                 self.base_url,
-                extra_headers=headers
+                extra_headers=headers,
+                ssl=self.ssl_context
             ) as websocket:
                 await self._handle_websocket_connection(websocket, toid, item_id, text)
         except TypeError as e:
@@ -6875,7 +7183,8 @@ class XianyuLive:
                 # 使用兼容模式，通过subprotocols传递部分头信息
                 async with websockets.connect(
                     self.base_url,
-                    additional_headers=headers
+                    additional_headers=headers,
+                    ssl=self.ssl_context
                 ) as websocket:
                     await self._handle_websocket_connection(websocket, toid, item_id, text)
             else:
@@ -6893,7 +7202,8 @@ class XianyuLive:
             # 尝试使用extra_headers参数
             return websockets.connect(
                 self.base_url,
-                extra_headers=headers
+                extra_headers=headers,
+                ssl=self.ssl_context
             )
         except Exception as e:
             # 捕获所有异常类型，不仅仅是TypeError
@@ -6906,7 +7216,8 @@ class XianyuLive:
                 try:
                     return websockets.connect(
                         self.base_url,
-                        additional_headers=headers
+                        additional_headers=headers,
+                        ssl=self.ssl_context
                     )
                 except Exception as e2:
                     error_msg2 = self._safe_str(e2)
@@ -6915,7 +7226,7 @@ class XianyuLive:
                     if "additional_headers" in error_msg2 or "unexpected keyword argument" in error_msg2:
                         # 如果都不支持，则不传递headers
                         logger.warning("websockets库不支持headers参数，使用基础连接模式")
-                        return websockets.connect(self.base_url)
+                        return websockets.connect(self.base_url, ssl=self.ssl_context)
                     else:
                         raise e2
             else:
@@ -6970,10 +7281,12 @@ class XianyuLive:
             # 创建带有cookies和headers的session
             headers = DEFAULT_HEADERS.copy()
             headers['cookie'] = self.cookies_str
+            connector = aiohttp.TCPConnector(ssl=self.ssl_context)
 
             self.session = aiohttp.ClientSession(
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=30)
+                timeout=aiohttp.ClientTimeout(total=30),
+                connector=connector
             )
 
     async def close_session(self):
@@ -7644,8 +7957,32 @@ class XianyuLive:
             except:
                 pass
 
-            # 判断是否为聊天消息
+            # 非聊天的系统更新包也可能包含“已付款，待发货”这类自动发货触发消息
             if not self.is_chat_message(message):
+                try:
+                    system_message = ""
+                    send_user_name = "系统订单消息"
+                    send_user_id = user_id or "unknown_user"
+
+                    if isinstance(message.get("4"), dict):
+                        message_4 = message["4"]
+                        system_message = message_4.get("reminderContent") or message_4.get("detailNotice", "")
+                        send_user_name = message_4.get("senderNick") or message_4.get("reminderTitle", send_user_name)
+                        send_user_id = message_4.get("senderUserId") or send_user_id
+
+                    if self._is_auto_delivery_trigger(system_message):
+                        chat_id_raw = message.get("2", "")
+                        chat_id = chat_id_raw.split('@')[0] if '@' in str(chat_id_raw) else str(chat_id_raw)
+                        logger.info(
+                            f'[{msg_time}] 【{self.cookie_id}】检测到非聊天自动发货触发消息，继续处理: {system_message}'
+                        )
+                        await self._handle_auto_delivery(
+                            websocket, message, send_user_name, send_user_id, item_id, chat_id, msg_time
+                        )
+                        return
+                except Exception as e:
+                    logger.error(f"处理非聊天自动发货消息失败: {self._safe_str(e)}")
+
                 logger.warning("非聊天消息")
                 return
 
@@ -7850,15 +8187,9 @@ class XianyuLive:
                         except Exception as e:
                             logger.error(f'[{msg_time}] 【{self.cookie_id}】标记小刀订单失败: {self._safe_str(e)}')
 
-                        # 延迟2秒后执行免拼发货
-                        logger.info(f'[{msg_time}] 【{self.cookie_id}】延迟2秒后执行免拼发货...')
+                        # 延迟2秒后交由统一自动发货流程处理
+                        logger.info(f'[{msg_time}] 【{self.cookie_id}】延迟2秒后交由统一自动发货流程处理...')
                         await asyncio.sleep(2)
-                        # 调用自动免拼发货方法
-                        result = await self.auto_freeshipping(order_id, item_id, send_user_id)
-                        if result.get('success'):
-                            logger.info(f'[{msg_time}] 【{self.cookie_id}】✅ 自动免拼发货成功')
-                        else:
-                            logger.warning(f'[{msg_time}] 【{self.cookie_id}】❌ 自动免拼发货失败: {result.get("error", "未知错误")}')
                         await self._handle_auto_delivery(websocket, message, send_user_name, send_user_id,
                                                        item_id, chat_id, msg_time)
                         return
@@ -8336,6 +8667,7 @@ class XianyuLive:
                         self.cookies.update(new_cookies)
                         # 生成新的cookie字符串
                         self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+                        self._sync_runtime_cookies(self.cookies_str)
                         # 更新数据库中的Cookie
                         await self.update_config_cookies()
                         logger.warning("已更新Cookie到数据库")
@@ -8457,8 +8789,17 @@ class XianyuLive:
             result = await self.get_item_list_info(page_number, page_size)
 
             if not result.get("success"):
+                error_msg = result.get("error", f"获取第 {page_number} 页失败")
                 logger.error(f"获取第 {page_number} 页失败: {result}")
-                break
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "failed_page": page_number,
+                    "total_pages": max(page_number - 1, 0),
+                    "total_count": len(all_items),
+                    "total_saved": total_saved,
+                    "items": all_items
+                }
 
             current_items = result.get("items", [])
             if not current_items:

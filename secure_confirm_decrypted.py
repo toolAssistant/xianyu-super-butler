@@ -44,6 +44,20 @@ class SecureConfirm:
         except:
             return "无法转换的对象"
 
+    def _is_session_invalid_error(self, error_msg):
+        """判断是否为会话或令牌失效错误。"""
+        if not error_msg:
+            return False
+
+        invalid_keywords = [
+            'FAIL_SYS_SESSION_EXPIRED',
+            'Session过期',
+            'FAIL_SYS_TOKEN_EXOIRED',
+            'FAIL_SYS_TOKEN_EXPIRED',
+            '令牌过期',
+        ]
+        return any(keyword in error_msg for keyword in invalid_keywords)
+
     async def _get_real_item_id(self):
         """从数据库中获取一个真实的商品ID"""
         try:
@@ -134,7 +148,8 @@ class SecureConfirm:
             async with self.session.post(
                 'https://h5api.m.goofish.com/h5/mtop.taobao.idle.logistic.consign.dummy/1.0/',
                 params=params,
-                data=data
+                data=data,
+                headers={'cookie': self.cookies_str}
             ) as response:
                 res_json = await response.json()
 
@@ -164,6 +179,10 @@ class SecureConfirm:
                 else:
                     error_msg = res_json.get('ret', ['未知错误'])[0] if res_json.get('ret') else '未知错误'
                     logger.warning(f"【{self.cookie_id}】❌ 自动确认发货失败: {error_msg}")
+
+                    if self._is_session_invalid_error(error_msg):
+                        logger.warning(f"【{self.cookie_id}】检测到发货确认会话失效，停止模块内重试，交由主流程刷新Cookie后重试")
+                        return {"error": error_msg, "order_id": order_id}
 
                     return await self.auto_confirm(order_id, item_id, retry_count + 1)
 

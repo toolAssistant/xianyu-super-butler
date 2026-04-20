@@ -200,7 +200,7 @@ const Settings: React.FC = () => {
                   className="w-full ios-input px-4 py-3 rounded-xl text-sm"
                   placeholder="https://api.openai.com/v1"
                 />
-                <p className="text-xs text-gray-500">无需补全 /chat/completions</p>
+                <p className="text-xs text-gray-500">无需补全 /chat/completions；仅填域名时系统会自动补全 /v1</p>
               </div>
 
               <div className="space-y-3">
@@ -225,16 +225,23 @@ const Settings: React.FC = () => {
 
               <div className="space-y-3">
                 <label className="block text-sm font-bold text-gray-800">模型</label>
-                <select
+                <input
+                  type="text"
+                  list="ai-model-options"
                   value={settings.ai_model || 'qwen-plus'}
                   onChange={e => setSettings({...settings, ai_model: e.target.value})}
                   className="w-full ios-input px-4 py-3 rounded-xl"
-                >
-                  <option value="qwen-plus">通义千问 Plus</option>
-                  <option value="qwen-turbo">通义千问 Turbo</option>
-                  <option value="gpt-3.5-turbo">GPT-3.5 Turbo</option>
-                  <option value="gpt-4">GPT-4</option>
-                </select>
+                  placeholder="例如：gpt-5.4"
+                />
+                <datalist id="ai-model-options">
+                  <option value="gpt-5.4" />
+                  <option value="gpt-5" />
+                  <option value="gpt-4.1" />
+                  <option value="gpt-4o" />
+                  <option value="qwen-plus" />
+                  <option value="qwen-turbo" />
+                </datalist>
+                <p className="text-xs text-gray-500">支持输入任意 OpenAI 兼容模型名，例如 `gpt-5.4`</p>
               </div>
 
               <div className="space-y-3">

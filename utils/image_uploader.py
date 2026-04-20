@@ -5,11 +5,17 @@ import aiohttp
 import asyncio
 import json
 import os
+import ssl
 import tempfile
 from typing import Optional, Dict, Any
 from loguru import logger
 from PIL import Image
 import io
+
+try:
+    import certifi
+except ImportError:
+    certifi = None
 
 
 class ImageUploader:
@@ -19,11 +25,22 @@ class ImageUploader:
         self.cookies_str = cookies_str
         self.upload_url = "https://stream-upload.goofish.com/api/upload.api?floderId=0&appkey=xy_chat&_input_charset=utf-8"
         self.session = None
+        self.ssl_context = self._build_ssl_context()
+
+    def _build_ssl_context(self):
+        """优先使用certifi证书链，避免本地Python缺少根证书。"""
+        if certifi:
+            return ssl.create_default_context(cafile=certifi.where())
+        return ssl.create_default_context()
     
     async def create_session(self):
         """创建HTTP会话"""
         if not self.session:
-            connector = aiohttp.TCPConnector(limit=100, limit_per_host=30)
+            connector = aiohttp.TCPConnector(
+                limit=100,
+                limit_per_host=30,
+                ssl=self.ssl_context
+            )
             timeout = aiohttp.ClientTimeout(total=30)
             self.session = aiohttp.ClientSession(
                 connector=connector,

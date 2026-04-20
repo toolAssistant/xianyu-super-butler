@@ -169,6 +169,7 @@ export interface OrderAnalytics {
 export interface SystemSettings {
   ai_model?: string;
   ai_api_key?: string;
+  ai_api_url?: string;
   ai_base_url?: string;
   default_reply?: string;
   registration_enabled?: boolean;

@@ -152,7 +152,8 @@ def get_current_user_from_session_cookie(session: Optional[str] = Cookie(default
 
 # 扫码登录检查锁 - 防止并发处理同一个session
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
-qr_check_processed = {}  # 记录已处理的session: {session_id: {'processed': bool, 'timestamp': float}}
+qr_check_processed = {}  # 记录扫码处理状态: {session_id: {'status': str, 'timestamp': float, ...}}
+qr_check_tasks = {}  # 后台扫码处理任务: {session_id: asyncio.Task}
 
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
@@ -172,10 +173,69 @@ def cleanup_qr_check_records():
             expired_sessions.append(session_id)
 
     for session_id in expired_sessions:
+        task = qr_check_tasks.pop(session_id, None)
+        if task and not task.done():
+            task.cancel()
         if session_id in qr_check_processed:
             del qr_check_processed[session_id]
         if session_id in qr_check_locks:
             del qr_check_locks[session_id]
+
+
+def _build_qr_status_response(session_id: str) -> Optional[Dict[str, Any]]:
+    """根据后台扫码处理记录构造前端轮询响应"""
+    record = qr_check_processed.get(session_id)
+    if not record:
+        return None
+
+    status = record.get('status', 'processing')
+    response = {
+        'status': status,
+        'message': record.get('message', ''),
+        'session_id': session_id,
+    }
+
+    if record.get('account_info'):
+        response['account_info'] = record['account_info']
+
+    if record.get('verification_url'):
+        response['verification_url'] = record['verification_url']
+
+    return response
+
+
+async def _process_qr_login_session(session_id: str, cookies: str, unb: str, current_user: Dict[str, Any]) -> None:
+    """后台处理扫码成功后的 Cookie 刷新和账号入库，避免阻塞轮询接口"""
+    try:
+        account_info = await process_qr_login_cookies(cookies, unb, current_user)
+        qr_check_processed[session_id] = {
+            'status': 'success',
+            'message': '扫码登录处理完成',
+            'account_info': account_info,
+            'timestamp': time.time(),
+        }
+        log_with_user(
+            'info',
+            f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}",
+            current_user
+        )
+    except asyncio.CancelledError:
+        qr_check_processed[session_id] = {
+            'status': 'error',
+            'message': '扫码登录处理被取消，请重新扫码',
+            'timestamp': time.time(),
+        }
+        raise
+    except Exception as e:
+        message = f"扫码登录处理失败: {str(e)}"
+        qr_check_processed[session_id] = {
+            'status': 'error',
+            'message': message,
+            'timestamp': time.time(),
+        }
+        log_with_user('error', f"扫码登录后台处理异常: {session_id}, {str(e)}", current_user)
+    finally:
+        qr_check_tasks.pop(session_id, None)
 
 
 def load_keywords() -> List[Tuple[str, str]]:
@@ -2320,13 +2380,10 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         # 清理过期记录
         cleanup_qr_check_records()
 
-        # 检查是否已经处理过
-        if session_id in qr_check_processed:
-            record = qr_check_processed[session_id]
-            if record['processed']:
-                log_with_user('debug', f"扫码登录session {session_id} 已处理过，直接返回", current_user)
-                # 返回简单的成功状态，避免重复处理
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+        cached_response = _build_qr_status_response(session_id)
+        if cached_response:
+            log_with_user('debug', f"扫码登录session {session_id} 命中后台处理状态: {cached_response['status']}", current_user)
+            return cached_response
 
         # 获取该session的锁
         session_lock = qr_check_locks[session_id]
@@ -2334,13 +2391,16 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
         # 使用非阻塞方式尝试获取锁
         if session_lock.locked():
             log_with_user('debug', f"扫码登录session {session_id} 正在被其他请求处理，跳过", current_user)
-            return {'status': 'processing', 'message': '正在处理中，请稍候...'}
+            cached_response = _build_qr_status_response(session_id)
+            if cached_response:
+                return cached_response
+            return {'status': 'processing', 'message': '正在处理中，请稍候...', 'session_id': session_id}
 
         async with session_lock:
-            # 再次检查是否已处理（双重检查）
-            if session_id in qr_check_processed and qr_check_processed[session_id]['processed']:
-                log_with_user('debug', f"扫码登录session {session_id} 在获取锁后发现已处理，直接返回", current_user)
-                return {'status': 'already_processed', 'message': '该会话已处理完成'}
+            cached_response = _build_qr_status_response(session_id)
+            if cached_response:
+                log_with_user('debug', f"扫码登录session {session_id} 在获取锁后命中状态: {cached_response['status']}", current_user)
+                return cached_response
 
             # 清理过期会话
             qr_login_manager.cleanup_expired_sessions()
@@ -2350,24 +2410,29 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
             log_with_user('info', f"获取会话状态1111111: {status_info}", current_user)
             if status_info['status'] == 'success':
                 log_with_user('info', f"获取会话状态22222222: {status_info}", current_user)
-                # 登录成功，处理Cookie（现在包含获取真实cookie的逻辑）
                 cookies_info = qr_login_manager.get_session_cookies(session_id)
                 log_with_user('info', f"获取会话Cookie: {cookies_info}", current_user)
                 if cookies_info:
-                    account_info = await process_qr_login_cookies(
-                        cookies_info['cookies'],
-                        cookies_info['unb'],
-                        current_user
-                    )
-                    status_info['account_info'] = account_info
-
-                    log_with_user('info', f"扫码登录处理完成: {session_id}, 账号: {account_info.get('account_id', 'unknown')}", current_user)
-
-                    # 标记该session已处理
                     qr_check_processed[session_id] = {
-                        'processed': True,
-                        'timestamp': time.time()
+                        'status': 'processing',
+                        'message': '扫码成功，正在处理登录和风控验证，请稍候...',
+                        'timestamp': time.time(),
                     }
+                    qr_check_tasks[session_id] = asyncio.create_task(
+                        _process_qr_login_session(
+                            session_id,
+                            cookies_info['cookies'],
+                            cookies_info['unb'],
+                            current_user.copy()
+                        )
+                    )
+                    return _build_qr_status_response(session_id)
+
+                return {
+                    'status': 'processing',
+                    'message': '扫码成功，正在同步登录信息，请稍后重试...',
+                    'session_id': session_id,
+                }
 
             return status_info
 
@@ -7017,18 +7082,18 @@ async def manual_ship_orders(
                             log_with_user('warning', f"获取订单数量失败，使用默认数量1: {str(e)}", current_user)
 
                     # 调用_auto_delivery获取卡券内容（内部会调用auto_confirm）
-                    delivery_contents = []
+                    delivery_results = []
                     for i in range(quantity_to_send):
                         try:
-                            delivery_content = await live_instance._auto_delivery(
+                            delivery_result = await live_instance._auto_delivery(
                                 item_id, '', order_id, buyer_id
                             )
-                            if delivery_content:
-                                delivery_contents.append(delivery_content)
+                            if delivery_result and delivery_result.get('content'):
+                                delivery_results.append(delivery_result)
                         except Exception as e:
                             log_with_user('error', f"获取第{i+1}个卡券失败: {str(e)}", current_user)
 
-                    if not delivery_contents:
+                    if not delivery_results:
                         results.append({
                             'order_id': order_id,
                             'success': False,
@@ -7036,6 +7101,16 @@ async def manual_ship_orders(
                         })
                         failed_count += 1
                         continue
+
+                    delivery_contents = [result['content'] for result in delivery_results]
+                    platform_shipment_confirmed = any(
+                        result.get('platform_shipment_confirmed', False) for result in delivery_results
+                    )
+                    confirm_failure_reasons = [
+                        result.get('confirm_error') or '自动确认发货未成功'
+                        for result in delivery_results
+                        if not result.get('platform_shipment_confirmed', False)
+                    ]
 
                     # 发送卡券内容给买家
                     send_success = True
@@ -7068,27 +7143,41 @@ async def manual_ship_orders(
                             log_with_user('error', f"发送第{idx+1}条卡券消息失败: {str(e)}", current_user)
                             send_success = False
 
-                    # 更新本地数据库状态
-                    db_manager.insert_or_update_order(
-                        order_id=order_id,
-                        order_status='shipped',
-                        system_shipped=True
-                    )
-
-                    if send_success:
+                    if send_success and platform_shipment_confirmed:
+                        db_manager.insert_or_update_order(
+                            order_id=order_id,
+                            order_status='shipped',
+                            system_shipped=True
+                        )
                         results.append({
                             'order_id': order_id,
                             'success': True,
                             'message': f'完整发货成功，已发送{len(delivery_contents)}条卡券信息给买家'
                         })
                         success_count += 1
-                    else:
+                    elif send_success:
+                        confirm_error = '；'.join(dict.fromkeys(confirm_failure_reasons))
                         results.append({
                             'order_id': order_id,
-                            'success': True,
-                            'message': f'发货状态已更新，但部分卡券消息发送失败（共{len(delivery_contents)}条）'
+                            'success': False,
+                            'message': f'卡密已发送，但闲鱼发货状态修改失败: {confirm_error}'
                         })
-                        success_count += 1
+                        failed_count += 1
+                    else:
+                        if platform_shipment_confirmed:
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': f'闲鱼发货状态已修改，但部分卡券消息发送失败（共{len(delivery_contents)}条）'
+                            })
+                        else:
+                            confirm_error = '；'.join(dict.fromkeys(confirm_failure_reasons))
+                            results.append({
+                                'order_id': order_id,
+                                'success': False,
+                                'message': f'卡密发送不完整，且闲鱼发货状态修改失败: {confirm_error}'
+                            })
+                        failed_count += 1
 
             except Exception as e:
                 results.append({

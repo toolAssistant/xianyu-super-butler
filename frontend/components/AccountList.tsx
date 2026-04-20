@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { AccountDetail, AIReplySettings } from '../types';
 import {
@@ -30,8 +30,11 @@ const AccountList: React.FC = () => {
   const [showQRModal, setShowQRModal] = useState(false);
   const [qrCodeUrl, setQrCodeUrl] = useState<string>('');
   const [qrStatus, setQrStatus] = useState<string>('pending');
+  const [qrMessage, setQrMessage] = useState<string>('');
+  const [qrVerificationUrl, setQrVerificationUrl] = useState<string>('');
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
+  const qrPollTimerRef = useRef<number | null>(null);
 
   // 编辑表单状态
   const [editForm, setEditForm] = useState({
@@ -86,8 +89,95 @@ const AccountList: React.FC = () => {
     }
   };
 
+  const clearQRPolling = () => {
+    if (qrPollTimerRef.current !== null) {
+      window.clearTimeout(qrPollTimerRef.current);
+      qrPollTimerRef.current = null;
+    }
+  };
+
+  const closeQRModal = () => {
+    clearQRPolling();
+    setShowQRModal(false);
+  };
+
+  const scheduleQRStatusCheck = (sessionId: string, delay: number = 1500) => {
+    clearQRPolling();
+    qrPollTimerRef.current = window.setTimeout(() => {
+      void pollQRLoginStatus(sessionId);
+    }, delay);
+  };
+
+  const pollQRLoginStatus = async (sessionId: string) => {
+    try {
+      const statusRes = await checkQRLoginStatus(sessionId);
+      const nextStatus = statusRes.status || 'error';
+
+      if (nextStatus === 'success' || nextStatus === 'already_processed') {
+        clearQRPolling();
+        setQrVerificationUrl('');
+        setQrStatus('success');
+        setQrMessage(statusRes.message || '登录成功，正在刷新账号列表');
+        window.setTimeout(() => {
+          setShowQRModal(false);
+          void loadAccounts();
+        }, 1000);
+        return;
+      }
+
+      if (nextStatus === 'waiting' || nextStatus === 'scanned' || nextStatus === 'processing') {
+        setQrStatus(nextStatus);
+        setQrVerificationUrl(statusRes.verification_url || '');
+        setQrMessage(
+          statusRes.message ||
+          (nextStatus === 'scanned'
+            ? '已扫码，请在闲鱼APP确认登录'
+            : nextStatus === 'processing'
+              ? '扫码成功，正在处理登录和风控验证，请稍候...'
+              : '请打开闲鱼APP扫描下方二维码')
+        );
+        scheduleQRStatusCheck(sessionId, nextStatus === 'processing' ? 2000 : 1200);
+        return;
+      }
+
+      if (nextStatus === 'verification_required') {
+        clearQRPolling();
+        setQrStatus('verification_required');
+        setQrVerificationUrl(statusRes.verification_url || '');
+        setQrMessage(statusRes.message || '账号触发风控，请先完成验证');
+        return;
+      }
+
+      clearQRPolling();
+      setQrVerificationUrl('');
+
+      if (nextStatus === 'expired') {
+        setQrStatus('error');
+        setQrMessage('二维码已过期，请重新获取');
+        return;
+      }
+
+      if (nextStatus === 'cancelled') {
+        setQrStatus('error');
+        setQrMessage('已取消登录，请重新扫码');
+        return;
+      }
+
+      setQrStatus('error');
+      setQrMessage(statusRes.message || '检查扫码状态失败，请重试');
+    } catch (error) {
+      clearQRPolling();
+      setQrStatus('error');
+      setQrVerificationUrl('');
+      setQrMessage(error instanceof Error ? error.message : '检查扫码状态失败，请重试');
+    }
+  };
+
   useEffect(() => {
     loadAccounts();
+    return () => {
+      clearQRPolling();
+    };
   }, []);
 
   const handleToggle = async (id: string, currentStatus: boolean) => {
@@ -205,31 +295,25 @@ const AccountList: React.FC = () => {
   };
 
   const startQRLogin = async () => {
+    clearQRPolling();
     setShowQRModal(true);
     setQrStatus('loading');
+    setQrMessage('正在生成二维码...');
+    setQrVerificationUrl('');
     try {
       const res = await generateQRLogin();
       if (res.success && res.qr_code_url && res.session_id) {
         setQrCodeUrl(res.qr_code_url);
         setQrStatus('waiting');
-
-        const interval = setInterval(async () => {
-          const statusRes = await checkQRLoginStatus(res.session_id!);
-          if (statusRes.status === 'success') {
-            clearInterval(interval);
-            setQrStatus('success');
-            setTimeout(() => {
-              setShowQRModal(false);
-              loadAccounts();
-            }, 1000);
-          } else if (statusRes.status === 'expired' || statusRes.status === 'error') {
-            clearInterval(interval);
-            setQrStatus('error');
-          }
-        }, 2000);
+        setQrMessage('请打开闲鱼APP扫描下方二维码');
+        scheduleQRStatusCheck(res.session_id, 1200);
+      } else {
+        setQrStatus('error');
+        setQrMessage('二维码生成失败，请重试');
       }
     } catch (e) {
       setQrStatus('error');
+      setQrMessage(e instanceof Error ? e.message : '二维码生成失败，请重试');
     }
   };
 
@@ -334,7 +418,7 @@ const AccountList: React.FC = () => {
           <div className="modal-overlay-centered">
               <div className="modal-container" style={{maxWidth: '24rem'}}>
                   <button
-                    onClick={() => setShowQRModal(false)}
+                    onClick={closeQRModal}
                     className="self-end p-2 bg-gray-100 rounded-full hover:bg-gray-200 transition-colors mb-6"
                   >
                     <X className="w-5 h-5 text-gray-600" />
@@ -343,11 +427,30 @@ const AccountList: React.FC = () => {
                   <div className="modal-body">
                       <div className="text-center">
                           <h3 className="text-2xl font-extrabold text-gray-900 mb-2">扫码登录</h3>
-                          <p className="text-gray-500 mb-8 font-medium">请打开闲鱼APP扫描下方二维码</p>
+                          <p className="text-gray-500 mb-8 font-medium">{qrMessage || '请打开闲鱼APP扫描下方二维码'}</p>
 
                           <div className="w-64 h-64 bg-[#F7F8FA] rounded-[2rem] mx-auto flex items-center justify-center overflow-hidden border-4 border-white shadow-inner mb-8 relative">
                               {qrStatus === 'loading' && <Loader2 className="w-10 h-10 text-[#FFE815] animate-spin" />}
-                              {qrStatus === 'waiting' && <img src={qrCodeUrl} alt="QR Code" className="w-full h-full p-2" />}
+                              {(qrStatus === 'waiting' || qrStatus === 'scanned' || qrStatus === 'processing') && qrCodeUrl && (
+                                  <img src={qrCodeUrl} alt="QR Code" className="w-full h-full p-2" />
+                              )}
+                              {qrStatus === 'scanned' && (
+                                  <div className="absolute inset-0 bg-white/88 flex flex-col items-center justify-center text-amber-600 animate-fade-in">
+                                      <div className="w-16 h-16 bg-amber-100 rounded-full flex items-center justify-center mb-4">
+                                         <QrCode className="w-8 h-8" />
+                                      </div>
+                                      <span className="font-bold text-lg">已扫码，待确认</span>
+                                  </div>
+                              )}
+                              {qrStatus === 'processing' && (
+                                  <div className="absolute inset-0 bg-white/92 flex flex-col items-center justify-center text-[#b88700] animate-fade-in">
+                                      <div className="w-16 h-16 bg-yellow-100 rounded-full flex items-center justify-center mb-4">
+                                         <Loader2 className="w-8 h-8 animate-spin" />
+                                      </div>
+                                      <span className="font-bold text-lg">正在处理登录</span>
+                                      <span className="text-xs mt-2 text-gray-500">这一步可能需要几十秒</span>
+                                  </div>
+                              )}
                               {qrStatus === 'success' && (
                                   <div className="absolute inset-0 bg-white/95 flex flex-col items-center justify-center text-green-600 animate-fade-in">
                                       <div className="w-16 h-16 bg-green-100 rounded-full flex items-center justify-center mb-4">
@@ -356,15 +459,34 @@ const AccountList: React.FC = () => {
                                       <span className="font-bold text-lg">登录成功</span>
                                   </div>
                               )}
+                              {qrStatus === 'verification_required' && (
+                                  <div className="flex flex-col items-center px-6 text-center">
+                                      <span className="text-amber-600 font-bold mb-3">需要完成风控验证</span>
+                                      {qrVerificationUrl && (
+                                          <a
+                                            href={qrVerificationUrl}
+                                            target="_blank"
+                                            rel="noreferrer"
+                                            className="text-sm bg-amber-100 text-amber-700 px-4 py-2 rounded-full hover:bg-amber-200"
+                                          >
+                                            打开验证页面
+                                          </a>
+                                      )}
+                                  </div>
+                              )}
                               {qrStatus === 'error' && (
                                   <div className="flex flex-col items-center">
-                                      <span className="text-red-500 font-bold mb-2">获取失败</span>
+                                      <span className="text-red-500 font-bold mb-2">{qrMessage || '获取失败'}</span>
                                       <button onClick={startQRLogin} className="text-xs bg-gray-200 px-3 py-1 rounded-full flex items-center gap-1 hover:bg-gray-300"><RefreshCw className="w-3 h-3"/> 重试</button>
                                   </div>
                               )}
                           </div>
 
-                          <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl">二维码有效期为5分钟，请尽快扫码。</p>
+                          <p className="text-xs text-gray-400 font-medium bg-gray-50 py-2 rounded-xl">
+                            {qrStatus === 'processing'
+                              ? '已扫码成功，系统正在同步 Cookie、处理风控并写入账号。'
+                              : '二维码有效期为5分钟，请尽快扫码。'}
+                          </p>
                       </div>
                   </div>
               </div>

@@ -15,6 +15,7 @@ import time
 import sqlite3
 import requests  # 确保已导入
 import threading
+from urllib.parse import urlparse
 from typing import List, Dict, Optional
 from loguru import logger
 from openai import OpenAI
@@ -69,16 +70,31 @@ class AIReplyEngine:
             return None
         
         try:
-            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={settings['base_url']}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
+            normalized_base_url = self._normalize_openai_base_url(settings.get('base_url', ''))
+            logger.info(f"创建新的OpenAI客户端实例 {cookie_id}: base_url={normalized_base_url}, api_key={'***' + settings['api_key'][-4:] if settings['api_key'] else 'None'}")
             client = OpenAI(
                 api_key=settings['api_key'],
-                base_url=settings['base_url']
+                base_url=normalized_base_url
             )
             logger.info(f"为账号 {cookie_id} 创建OpenAI客户端成功，实际base_url: {client.base_url}")
             return client
         except Exception as e:
             logger.error(f"创建OpenAI客户端失败 {cookie_id}: {e}")
             return None
+
+    def _normalize_openai_base_url(self, base_url: str) -> str:
+        """OpenAI兼容接口支持仅填域名，调用时自动补全 /v1。"""
+        if not base_url:
+            return base_url
+
+        normalized = base_url.strip().rstrip('/')
+        parsed = urlparse(normalized)
+        path = (parsed.path or '').rstrip('/')
+
+        if parsed.scheme and parsed.netloc and not path:
+            return f"{normalized}/v1"
+
+        return normalized
 
     def _is_dashscope_api(self, settings: dict) -> bool:
         """判断是否为DashScope API - 只有选择自定义模型时才使用"""
