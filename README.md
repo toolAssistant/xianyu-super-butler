@@ -99,6 +99,27 @@ python Start.py
 # 浏览器打开 http://localhost:8080
 ```
 
+### macOS 常驻运行（launchd）
+
+如果你是在 macOS 本机长期跑这个项目，推荐用 `launchd` 托管，避免关闭终端后服务一起退出。
+
+```bash
+# 安装并立即启动
+bash scripts/launchd/install.sh
+
+# 查看状态
+bash scripts/launchd/status.sh
+
+# 卸载
+bash scripts/launchd/uninstall.sh
+```
+
+说明：
+- `launchd` 配置模板在 `launchd/com.xianyu.superbutler.plist.template`
+- 安装后会写入 `~/Library/LaunchAgents/com.xianyu.superbutler.plist`
+- 日志输出到 `logs/launchd.stdout.log` 和 `logs/launchd.stderr.log`
+- 服务仍然访问 `http://localhost:8080`
+
 ### 🔐 默认登录信息
 
 ```

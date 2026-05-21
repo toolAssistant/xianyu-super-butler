@@ -50,7 +50,17 @@ SESSION_EXPIRE_SECONDS = 24 * 60 * 60
 
 
 def _get_db_path() -> str:
-    return os.getenv('DB_PATH', 'data/xianyu_data.db')
+    configured_path = os.getenv('DB_PATH')
+    if configured_path:
+        if os.path.isabs(configured_path):
+            return configured_path
+        return str((Path(__file__).resolve().parent / configured_path).resolve())
+
+    db_path = getattr(db_manager, 'db_path', None)
+    if db_path:
+        return db_path
+
+    return str((Path(__file__).resolve().parent / 'data/xianyu_data.db').resolve())
 
 
 def _init_sessions_table_if_needed():
@@ -320,6 +330,25 @@ class CaptchaRequest(BaseModel):
     session_id: str
 
 
+def _authenticate_user_by_identifier(identifier: str, password: str) -> Optional[Dict[str, Any]]:
+    """允许使用用户名或邮箱进行密码登录。"""
+    from db_manager import db_manager
+
+    normalized_identifier = (identifier or '').strip()
+    if not normalized_identifier or not password:
+        return None
+
+    user = db_manager.get_user_by_username(normalized_identifier)
+    if user and db_manager.verify_user_password(user['username'], password):
+        return user
+
+    user = db_manager.get_user_by_email(normalized_identifier)
+    if user and db_manager.verify_user_password(user['username'], password):
+        return user
+
+    return None
+
+
 class CaptchaResponse(BaseModel):
     success: bool
     captcha_image: str
@@ -523,28 +552,119 @@ if not os.path.exists(uploads_dir):
 async def health_check():
     """健康检查端点，用于Docker健康检查和负载均衡器"""
     try:
-        # 检查Cookie管理器状态
-        manager_status = "ok" if cookie_manager.manager is not None else "error"
+        manager = cookie_manager.manager
+        manager_status = "ok" if manager is not None else "error"
 
-        # 检查数据库连接
         from db_manager import db_manager
         try:
-            db_manager.get_all_cookies()
+            all_cookies = db_manager.get_all_cookies()
             db_status = "ok"
         except Exception:
+            all_cookies = {}
             db_status = "error"
 
-        # 获取系统状态
+        instances = {}
+        if manager is not None:
+            try:
+                from XianyuAutoAsync import XianyuLive
+                instances = XianyuLive.get_all_instances()
+            except Exception:
+                instances = {}
+
+        account_summary = {
+            "total": len(all_cookies),
+            "enabled": 0,
+            "disabled": 0,
+            "connected": 0,
+            "connecting": 0,
+            "reconnecting": 0,
+            "failed": 0,
+            "disconnected": 0,
+            "closed": 0,
+            "task_stopped": 0,
+            "no_instance": 0,
+            "unknown": 0,
+        }
+        account_details = []
+
+        for cookie_id in all_cookies.keys():
+            enabled = manager.get_cookie_status(cookie_id) if manager is not None else True
+            task = manager.tasks.get(cookie_id) if manager is not None else None
+            task_running = bool(task and not task.done())
+            instance = instances.get(cookie_id)
+            raw_state = getattr(instance, 'connection_state', None) if instance is not None else None
+            connection_state = raw_state.value if hasattr(raw_state, 'value') else None
+
+            if not enabled:
+                derived_state = 'disabled'
+            elif not task_running:
+                derived_state = 'task_stopped'
+            elif instance is None:
+                derived_state = 'no_instance'
+            else:
+                derived_state = connection_state or 'unknown'
+
+            account_summary[derived_state] = account_summary.get(derived_state, 0) + 1
+            if enabled:
+                account_summary['enabled'] += 1
+            else:
+                account_summary['disabled'] += 1
+
+            account_details.append({
+                "cookie_id": cookie_id,
+                "enabled": enabled,
+                "task_running": task_running,
+                "instance_registered": instance is not None,
+                "connection_state": derived_state,
+                "connection_failures": getattr(instance, 'connection_failures', None) if instance is not None else None,
+                "last_token_refresh_status": getattr(instance, 'last_token_refresh_status', None) if instance is not None else None,
+            })
+
+        enabled_accounts = account_summary["enabled"]
+        connected_accounts = account_summary["connected"]
+        transient_accounts = account_summary["connecting"] + account_summary["reconnecting"]
+        hard_failure_accounts = (
+            account_summary["failed"]
+            + account_summary["disconnected"]
+            + account_summary["closed"]
+            + account_summary["task_stopped"]
+            + account_summary["no_instance"]
+            + account_summary["unknown"]
+        )
+
+        if enabled_accounts == 0:
+            business_status = "not_configured"
+        elif connected_accounts == enabled_accounts:
+            business_status = "ok"
+        elif connected_accounts > 0 or transient_accounts > 0:
+            business_status = "degraded"
+        elif hard_failure_accounts > 0:
+            business_status = "error"
+        else:
+            business_status = "unknown"
+
         import psutil
         cpu_percent = psutil.cpu_percent(interval=1)
         memory_info = psutil.virtual_memory()
 
+        if manager_status != "ok" or db_status != "ok" or business_status == "error":
+            overall_status = "unhealthy"
+        elif business_status in ("degraded", "unknown"):
+            overall_status = "degraded"
+        else:
+            overall_status = "healthy"
+
         status = {
-            "status": "healthy" if manager_status == "ok" and db_status == "ok" else "unhealthy",
+            "status": overall_status,
             "timestamp": time.time(),
             "services": {
                 "cookie_manager": manager_status,
-                "database": db_status
+                "database": db_status,
+                "business": business_status,
+            },
+            "accounts": {
+                "summary": account_summary,
+                "details": account_details,
             },
             "system": {
                 "cpu_percent": cpu_percent,
@@ -643,49 +763,47 @@ async def login(request: LoginRequest):
 
     # 判断登录方式
     if request.username and request.password:
-        # 用户名/密码登录
-        logger.info(f"【{request.username}】尝试用户名登录")
+        # 账号/密码登录（兼容用户名或邮箱）
+        logger.info(f"【{request.username}】尝试账号密码登录")
 
-        # 统一使用用户表验证（包括admin用户）
-        if db_manager.verify_user_password(request.username, request.password):
-            user = db_manager.get_user_by_username(request.username)
-            if user:
-                # 创建 Cookie Session
-                session_id = _create_session({
-                    'id': user['id'],
-                    'username': user['username'],
-                    'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
-                })
+        user = _authenticate_user_by_identifier(request.username, request.password)
+        if user:
+            # 创建 Cookie Session
+            session_id = _create_session({
+                'id': user['id'],
+                'username': user['username'],
+                'is_admin': bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME,
+            })
 
-                # 区分管理员和普通用户的日志
-                if user['username'] == ADMIN_USERNAME:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
-                else:
-                    logger.info(f"【{user['username']}#{user['id']}】登录成功")
+            # 区分管理员和普通用户的日志
+            if user['username'] == ADMIN_USERNAME:
+                logger.info(f"【{user['username']}#{user['id']}】登录成功（管理员）")
+            else:
+                logger.info(f"【{user['username']}#{user['id']}】登录成功")
 
-                resp = JSONResponse(content=LoginResponse(
-                    success=True,
-                    token=None,
-                    message="登录成功",
-                    user_id=user['id'],
-                    username=user['username'],
-                    is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
-                ).model_dump())
-                resp.set_cookie(
-                    key=SESSION_COOKIE_NAME,
-                    value=session_id,
-                    httponly=True,
-                    samesite='lax',
-                    secure=False,
-                    max_age=SESSION_EXPIRE_SECONDS,
-                    path='/',
-                )
-                return resp
+            resp = JSONResponse(content=LoginResponse(
+                success=True,
+                token=None,
+                message="登录成功",
+                user_id=user['id'],
+                username=user['username'],
+                is_admin=bool(user.get('is_admin', False)) or user['username'] == ADMIN_USERNAME
+            ).model_dump())
+            resp.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=session_id,
+                httponly=True,
+                samesite='lax',
+                secure=False,
+                max_age=SESSION_EXPIRE_SECONDS,
+                path='/',
+            )
+            return resp
 
-        logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
+        logger.warning(f"【{request.username}】登录失败：账号或密码错误")
         return LoginResponse(
             success=False,
-            message="用户名或密码错误"
+            message="账号或密码错误"
         )
 
     elif request.email and request.password:

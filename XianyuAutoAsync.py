@@ -1913,26 +1913,45 @@ class XianyuLive:
                 from utils.xianyu_slider_stealth import XianyuSliderStealth
                 logger.info(f"【{self.cookie_id}】XianyuSliderStealth导入成功，使用滑块验证")
 
-                # 创建独立的滑块验证实例（每个用户独立实例，避免并发冲突）
-                slider_stealth = XianyuSliderStealth(
-                    # user_id=f"{self.cookie_id}_{int(time.time() * 1000)}",  # 使用唯一ID避免冲突
-                    user_id=f"{self.cookie_id}",  # 使用唯一ID避免冲突
-                    enable_learning=True,  # 启用学习功能
-                    headless=True  # 使用无头模式
-                )
-
                 # 在线程池中执行滑块验证
                 import asyncio
                 import concurrent.futures
 
+                show_browser = False
+                try:
+                    from db_manager import db_manager
+                    cookie_details = db_manager.get_cookie_details(self.cookie_id)
+                    show_browser = bool(cookie_details.get('show_browser', False)) if cookie_details else False
+                except Exception as config_e:
+                    logger.warning(f"【{self.cookie_id}】读取滑块浏览器模式配置失败，默认使用无头模式: {self._safe_str(config_e)}")
+
+                attempt_modes = [show_browser]
+                if not show_browser and not os.getenv('DOCKER_ENV'):
+                    attempt_modes.append(True)
+
+                success, cookies = False, None
                 loop = asyncio.get_event_loop()
                 with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证
-                    success, cookies = await loop.run_in_executor(
-                        executor,
-                        slider_stealth.run,
-                        verification_url
-                    )
+                    for current_show_browser in attempt_modes:
+                        browser_mode = "有头" if current_show_browser else "无头"
+                        logger.info(f"【{self.cookie_id}】开始使用{browser_mode}模式进行滑块验证")
+
+                        slider_stealth = XianyuSliderStealth(
+                            user_id=f"{self.cookie_id}",
+                            enable_learning=True,
+                            headless=not current_show_browser
+                        )
+
+                        success, cookies = await loop.run_in_executor(
+                            executor,
+                            slider_stealth.run,
+                            verification_url
+                        )
+
+                        if success and cookies:
+                            break
+
+                        logger.warning(f"【{self.cookie_id}】{browser_mode}模式滑块验证失败")
 
                 if success and cookies:
                     logger.info(f"【{self.cookie_id}】滑块验证成功，获取到新的cookies")
