@@ -46,6 +46,7 @@ class XianyuSearcher:
         self.browser = None
         self.context = None
         self.page = None
+        self.playwright = None
         self.api_responses = []
         self.user_id = "default"  # 默认用户ID
 
@@ -688,7 +689,7 @@ class XianyuSearcher:
             raise Exception("Playwright 未安装，无法使用真实搜索功能")
 
         if not self.browser:
-            playwright = await async_playwright().start()
+            self.playwright = await async_playwright().start()
             
             # 设置持久化数据目录（保存缓存、cookies等）
             import tempfile
@@ -722,7 +723,7 @@ class XianyuSearcher:
             
             # 使用 launch_persistent_context 实现跨会话的缓存持久化
             # 这样通过一次滑块验证后，下次搜索可以复用缓存，避免再次出现滑块
-            self.context = await playwright.chromium.launch_persistent_context(
+            self.context = await self.playwright.chromium.launch_persistent_context(
                 user_data_dir,  # 第一个参数是用户数据目录，用于持久化
                 headless=True,  # 无头模式，后台运行
                 args=browser_args,
@@ -761,6 +762,9 @@ class XianyuSearcher:
             # persistent_context 的 browser 会在 context 关闭时自动关闭
             # 不需要单独关闭 browser
             self.browser = None
+            if self.playwright:
+                await self.playwright.stop()
+                self.playwright = None
             logger.debug("商品搜索器浏览器已关闭（缓存已保存）")
         except Exception as e:
             logger.warning(f"关闭商品搜索器浏览器时出错: {e}")

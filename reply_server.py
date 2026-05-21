@@ -532,6 +532,25 @@ static_dir = os.path.join(os.path.dirname(__file__), 'static')
 if not os.path.exists(static_dir):
     os.makedirs(static_dir, exist_ok=True)
 
+frontend_index_path = os.path.join(static_dir, 'index.html')
+frontend_index_content: Optional[str] = None
+
+
+def _load_frontend_index() -> Optional[str]:
+    """将前端入口缓存到内存，避免每次请求重复打开文件。"""
+    global frontend_index_content
+
+    if frontend_index_content is not None:
+        return frontend_index_content
+
+    if not os.path.exists(frontend_index_path):
+        return None
+
+    with open(frontend_index_path, 'r', encoding='utf-8') as f:
+        frontend_index_content = f.read()
+
+    return frontend_index_content
+
 # 挂载静态文件目录
 app.mount('/static', StaticFiles(directory=static_dir), name='static')
 
@@ -689,12 +708,11 @@ async def health_check():
 # 服务 React 前端 SPA - 所有前端路由都返回 index.html
 async def serve_frontend():
     """服务 React 前端 SPA"""
-    index_path = os.path.join(static_dir, 'index.html')
-    if os.path.exists(index_path):
-        with open(index_path, 'r', encoding='utf-8') as f:
-            return HTMLResponse(f.read())
-    else:
-        return HTMLResponse('<h3>Frontend not found. Please build the frontend first.</h3>')
+    index_content = _load_frontend_index()
+    if index_content is not None:
+        return HTMLResponse(index_content)
+
+    return HTMLResponse('<h3>Frontend not found. Please build the frontend first.</h3>')
 
 @app.get('/', response_class=HTMLResponse)
 async def root():
