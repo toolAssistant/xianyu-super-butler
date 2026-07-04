@@ -6,7 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
-from urllib.parse import unquote
+from urllib.parse import unquote, urlsplit, urlunsplit
 from datetime import datetime
 from zoneinfo import ZoneInfo
 import html
@@ -210,6 +210,9 @@ qr_check_tasks = {}  # 后台扫码处理任务: {session_id: asyncio.Task}
 
 # 每日扫码登录推送配置与会话
 QR_LOGIN_PUSH_SETTING_KEY = "qr_login_push_settings"
+QR_LOGIN_PUSH_SENT_PREFIX = "qr_login_push_sent"
+QR_LOGIN_PUSH_RETRY_PREFIX = "qr_login_push_retry"
+QR_LOGIN_PUSH_SUCCESS_PREFIX = "qr_login_push_success"
 QR_LOGIN_PUSH_DEFAULTS = {
     "enabled": False,
     "schedule_time": "09:00",
@@ -217,6 +220,9 @@ QR_LOGIN_PUSH_DEFAULTS = {
     "account_ids": [],
     "channel_ids": [],
     "public_base_url": "",
+    "retry_enabled": True,
+    "retry_interval_minutes": 30,
+    "max_attempts": 5,
 }
 QR_LOGIN_PUSH_SESSION_TTL = 300
 qr_mobile_tokens = {}  # {session_id: {'token': str, 'user_id': int, 'account_id': str, 'expires_at': float}}
@@ -318,6 +324,15 @@ def _normalize_qr_login_push_settings(raw_settings: Any = None) -> Dict[str, Any
         if str(item).isdigit()
     ]
     settings['public_base_url'] = str(settings.get('public_base_url') or '').strip().rstrip('/')
+    settings['retry_enabled'] = bool(settings.get('retry_enabled', True))
+    try:
+        settings['retry_interval_minutes'] = int(settings.get('retry_interval_minutes') or 30)
+    except (TypeError, ValueError):
+        settings['retry_interval_minutes'] = 30
+    try:
+        settings['max_attempts'] = int(settings.get('max_attempts') or 5)
+    except (TypeError, ValueError):
+        settings['max_attempts'] = 5
     return settings
 
 
@@ -325,6 +340,110 @@ def _load_qr_login_push_settings(user_id: int) -> Dict[str, Any]:
     setting = db_manager.get_user_setting(user_id, QR_LOGIN_PUSH_SETTING_KEY)
     raw_value = setting.get('value') if setting else None
     return _normalize_qr_login_push_settings(raw_value)
+
+
+def _qr_login_push_sent_key(date_text: str, settings: Optional[Dict[str, Any]] = None) -> str:
+    if not settings:
+        return f"{QR_LOGIN_PUSH_SENT_PREFIX}:{date_text}"
+
+    key_payload = {
+        'schedule_time': settings.get('schedule_time') or '',
+        'account_ids': sorted(str(item) for item in settings.get('account_ids') or []),
+        'channel_ids': sorted(int(item) for item in settings.get('channel_ids') or []),
+        'public_base_url': settings.get('public_base_url') or '',
+    }
+    key_hash = hashlib.sha1(
+        json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:12]
+    return f"{QR_LOGIN_PUSH_SENT_PREFIX}:{date_text}:{key_hash}"
+
+
+def _qr_login_push_series_key(date_text: str, account_id: str, settings: Dict[str, Any]) -> str:
+    key_payload = {
+        'account_id': str(account_id),
+        'schedule_time': settings.get('schedule_time') or '',
+        'channel_ids': sorted(int(item) for item in settings.get('channel_ids') or []),
+        'public_base_url': settings.get('public_base_url') or '',
+    }
+    key_hash = hashlib.sha1(
+        json.dumps(key_payload, ensure_ascii=False, sort_keys=True).encode('utf-8')
+    ).hexdigest()[:12]
+    return f"{QR_LOGIN_PUSH_RETRY_PREFIX}:{date_text}:{key_hash}"
+
+
+def _qr_login_push_success_key(date_text: str, account_id: str) -> str:
+    return f"{QR_LOGIN_PUSH_SUCCESS_PREFIX}:{date_text}:{account_id}"
+
+
+def _get_qr_login_push_series_state(user_id: int, date_text: str, account_id: str, settings: Dict[str, Any]) -> Dict[str, Any]:
+    key = _qr_login_push_series_key(date_text, account_id, settings)
+    setting = db_manager.get_user_setting(user_id, key)
+    raw_value = setting.get('value') if setting else None
+    if isinstance(raw_value, str) and raw_value.strip():
+        try:
+            state = json.loads(raw_value)
+            if isinstance(state, dict):
+                state['key'] = key
+                return state
+        except json.JSONDecodeError:
+            pass
+    return {
+        'key': key,
+        'status': 'pending',
+        'attempts': 0,
+        'next_attempt_at': 0,
+        'last_session_id': '',
+        'last_error': '',
+        'created_at': time.time(),
+        'updated_at': time.time(),
+    }
+
+
+def _save_qr_login_push_series_state(user_id: int, state: Dict[str, Any]) -> None:
+    key = state.get('key')
+    if not key:
+        return
+    state_to_save = {item_key: item_value for item_key, item_value in state.items() if item_key != 'key'}
+    state_to_save['updated_at'] = time.time()
+    db_manager.set_user_setting(
+        user_id,
+        key,
+        json.dumps(state_to_save, ensure_ascii=False),
+        "每日扫码登录二维码重试状态"
+    )
+
+
+def _was_qr_login_push_account_success(user_id: int, date_text: str, account_id: str) -> bool:
+    setting = db_manager.get_user_setting(user_id, _qr_login_push_success_key(date_text, account_id))
+    return bool(setting and str(setting.get('value') or '').lower() == 'true')
+
+
+def _mark_qr_login_push_account_success(user_id: int, date_text: str, account_id: str) -> None:
+    db_manager.set_user_setting(
+        user_id,
+        _qr_login_push_success_key(date_text, account_id),
+        'true',
+        "每日扫码登录二维码账号成功标记"
+    )
+
+
+def _was_qr_login_push_sent(user_id: int, date_text: str, settings: Dict[str, Any]) -> bool:
+    today_key = _qr_login_push_sent_key(date_text, settings)
+    if (user_id, today_key) in qr_login_push_sent_dates:
+        return True
+    setting = db_manager.get_user_setting(user_id, today_key)
+    return bool(setting and str(setting.get('value') or '').lower() == 'true')
+
+
+def _mark_qr_login_push_sent(user_id: int, date_text: str, settings: Dict[str, Any]) -> None:
+    today_key = _qr_login_push_sent_key(date_text, settings)
+    qr_login_push_sent_dates.add((user_id, today_key))
+    db_manager.set_user_setting(
+        user_id,
+        today_key,
+        'true',
+        "每日扫码登录二维码已推送标记"
+    )
 
 
 def _save_qr_login_push_settings(user_id: int, settings: Dict[str, Any]) -> bool:
@@ -347,6 +466,12 @@ def _validate_qr_login_push_settings(settings: Dict[str, Any], user_id: int) -> 
         ZoneInfo(normalized['timezone'])
     except Exception:
         raise HTTPException(status_code=400, detail="无效的时区")
+
+    if normalized['retry_interval_minutes'] < 5 or normalized['retry_interval_minutes'] > 1440:
+        raise HTTPException(status_code=400, detail="重试间隔必须在 5-1440 分钟之间")
+
+    if normalized['max_attempts'] < 1 or normalized['max_attempts'] > 20:
+        raise HTTPException(status_code=400, detail="最大推送次数必须在 1-20 次之间")
 
     user_cookies = db_manager.get_all_cookies(user_id)
     invalid_accounts = [account_id for account_id in normalized['account_ids'] if account_id not in user_cookies]
@@ -375,14 +500,76 @@ def _validate_qr_login_push_settings(settings: Dict[str, Any], user_id: int) -> 
 
 def _build_public_base_url(request: Optional[Request], configured_base_url: str) -> str:
     if configured_base_url:
-        return configured_base_url.rstrip('/')
+        normalized_base_url = configured_base_url.rstrip('/')
+        if request is None:
+            normalized_base_url = _replace_localhost_base_url(normalized_base_url)
+        return normalized_base_url
     if request is not None:
         return str(request.base_url).rstrip('/')
-    return os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
+    env_base_url = os.getenv('PUBLIC_BASE_URL', '').strip().rstrip('/')
+    if env_base_url:
+        return env_base_url
+
+    host = os.getenv('WEB_HOST') or _guess_lan_host()
+    port = os.getenv('WEB_PORT') or '8080'
+    if host:
+        return f"http://{host}:{port}".rstrip('/')
+
+    return ''
+
+
+def _replace_localhost_base_url(base_url: str) -> str:
+    try:
+        parsed = urlsplit(base_url)
+        if parsed.hostname not in ('localhost', '127.0.0.1', '0.0.0.0'):
+            return base_url
+
+        host = _guess_lan_host()
+        if not host:
+            return base_url
+
+        port = parsed.port or os.getenv('WEB_PORT') or '8080'
+        netloc = f"{host}:{port}" if port else host
+        return urlunsplit((parsed.scheme or 'http', netloc, parsed.path, parsed.query, parsed.fragment)).rstrip('/')
+    except Exception:
+        return base_url
+
+
+def _is_qr_push_due(now: datetime, schedule_time: str) -> bool:
+    try:
+        hour, minute = [int(part) for part in schedule_time.split(':', 1)]
+        scheduled_at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    except Exception:
+        return False
+    return now >= scheduled_at
+
+
+def _guess_lan_host() -> str:
+    try:
+        import socket
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(('8.8.8.8', 80))
+            host = sock.getsockname()[0]
+            if host and not host.startswith('127.'):
+                return host
+    except Exception:
+        pass
+    return ''
 
 
 def _make_mobile_qr_url(base_url: str, session_id: str, token: str) -> str:
     return f"{base_url.rstrip('/')}/qr-login/mobile/{session_id}?token={token}"
+
+
+def _parse_push_api_success(text: str, success_codes: set) -> bool:
+    try:
+        payload = json.loads(text)
+        code = payload.get('code')
+        if code is None:
+            return False
+        return str(code) in success_codes
+    except Exception:
+        return False
 
 
 async def _send_qr_push_channel(channel: Dict[str, Any], title: str, content: str) -> Dict[str, Any]:
@@ -399,7 +586,8 @@ async def _send_qr_push_channel(channel: Dict[str, Any], title: str, content: st
         async with aiohttp.ClientSession() as session:
             async with session.post(api_url, data={'title': title, 'desp': content}, timeout=10) as response:
                 text = await response.text()
-                return {'success': response.status == 200, 'status': response.status, 'message': text[:300]}
+                success = response.status == 200 and _parse_push_api_success(text, {'0'})
+                return {'success': success, 'status': response.status, 'message': text[:300]}
 
     if channel_type == 'pushplus':
         token = (config.get('token') or config.get('config') or '').strip()
@@ -418,7 +606,8 @@ async def _send_qr_push_channel(channel: Dict[str, Any], title: str, content: st
         async with aiohttp.ClientSession() as session:
             async with session.post('http://www.pushplus.plus/send', json=payload, timeout=10) as response:
                 text = await response.text()
-                return {'success': response.status == 200, 'status': response.status, 'message': text[:300]}
+                success = response.status == 200 and _parse_push_api_success(text, {'200'})
+                return {'success': success, 'status': response.status, 'message': text[:300]}
 
     return {'success': False, 'message': f"不支持扫码推送渠道: {channel_type}"}
 
@@ -439,6 +628,11 @@ async def _send_qr_login_push_notice(user_id: int, channel_ids: List[int], title
             result = await _send_qr_push_channel(channel, title, content)
             result['channel_id'] = channel_id
             results.append(result)
+            logger.info(
+                f"扫码二维码推送结果: channel_id={channel_id}, "
+                f"success={result.get('success')}, status={result.get('status')}, "
+                f"message={result.get('message')}"
+            )
         except Exception as exc:
             results.append({'channel_id': channel_id, 'success': False, 'message': str(exc)})
             logger.error(f"扫码二维码推送失败: channel_id={channel_id}, error={exc}")
@@ -467,6 +661,10 @@ async def _create_and_push_qr_login_sessions(
     request: Optional[Request] = None,
     account_ids: Optional[List[str]] = None,
     channel_ids: Optional[List[int]] = None,
+    start_watch: bool = True,
+    auto_retry: bool = False,
+    attempt_number: Optional[int] = None,
+    max_attempts: Optional[int] = None,
 ) -> Dict[str, Any]:
     user_id = int(user['user_id'])
     settings_candidate = _normalize_qr_login_push_settings(settings)
@@ -537,9 +735,13 @@ async def _create_and_push_qr_login_sessions(
         qr_code_url = result.get('qr_code_url') or ''
         escaped_account = html.escape(account_id)
         escaped_mobile_url = html.escape(mobile_url, quote=True)
+        attempt_text = ''
+        if attempt_number and max_attempts:
+            attempt_text = f"<p>这是第 {attempt_number}/{max_attempts} 次扫码提醒。</p>"
         content = (
             f"<h3>闲鱼账号 {escaped_account} 扫码登录</h3>"
             f"<p>二维码5分钟内有效，扫码后后台会只更新这个目标账号。</p>"
+            f"{attempt_text}"
             f"<p><a href=\"{escaped_mobile_url}\">打开手机扫码页面</a></p>"
         )
         if qr_code_url.startswith('data:image/'):
@@ -552,20 +754,25 @@ async def _create_and_push_qr_login_sessions(
             f"闲鱼扫码登录：{account_id}",
             content
         )
+        channel_push_success = any(item.get('success') for item in channel_results)
 
-        watch_task = asyncio.create_task(
-            _watch_pushed_qr_login_session(
-                session_id=session_id,
-                target_account_id=account_id,
-                current_user=user.copy(),
-                settings={**normalized, 'channel_ids': selected_channels},
+        if start_watch and channel_push_success:
+            watch_task = asyncio.create_task(
+                _watch_pushed_qr_login_session(
+                    session_id=session_id,
+                    target_account_id=account_id,
+                    current_user=user.copy(),
+                    settings={**normalized, 'channel_ids': selected_channels},
+                    auto_retry=auto_retry,
+                    attempt_number=attempt_number,
+                    max_attempts=max_attempts,
+                )
             )
-        )
-        qr_login_push_watch_tasks[session_id] = watch_task
+            qr_login_push_watch_tasks[session_id] = watch_task
 
         pushes.append({
             'account_id': account_id,
-            'success': any(item.get('success') for item in channel_results),
+            'success': channel_push_success,
             'session_id': session_id,
             'mobile_url': mobile_url,
             'channel_results': channel_results,
@@ -591,19 +798,13 @@ async def qr_login_push_loop():
                         continue
                     if not settings.get('account_ids') or not settings.get('channel_ids'):
                         continue
-                    if not settings.get('public_base_url'):
-                        logger.warning(f"用户 {user_id} 已启用扫码推送但未配置访问基地址，跳过定时推送")
-                        continue
-
                     try:
                         now = datetime.now(ZoneInfo(settings.get('timezone') or 'Asia/Shanghai'))
                     except Exception:
                         now = datetime.now(ZoneInfo('Asia/Shanghai'))
 
-                    today_key = (user_id, now.date().isoformat())
-                    if now.strftime('%H:%M') != settings.get('schedule_time'):
-                        continue
-                    if today_key in qr_login_push_sent_dates:
+                    today_text = now.date().isoformat()
+                    if not _is_qr_push_due(now, settings.get('schedule_time') or '09:00'):
                         continue
 
                     current_user = {
@@ -611,12 +812,110 @@ async def qr_login_push_loop():
                         'username': user.get('username', f'user-{user_id}'),
                         'is_admin': False,
                     }
-                    try:
-                        await _create_and_push_qr_login_sessions(current_user, settings)
-                        qr_login_push_sent_dates.add(today_key)
-                        logger.info(f"用户 {user_id} 每日扫码登录二维码已推送")
-                    except Exception as exc:
-                        logger.error(f"用户 {user_id} 每日扫码登录二维码推送失败: {exc}")
+                    max_attempts = int(settings.get('max_attempts') or 5)
+                    for account_id in settings.get('account_ids') or []:
+                        if _was_qr_login_push_account_success(user_id, today_text, account_id):
+                            continue
+
+                        state = _get_qr_login_push_series_state(user_id, today_text, account_id, settings)
+                        attempts = int(state.get('attempts') or 0)
+                        status_value = state.get('status') or 'pending'
+
+                        now_ts = time.time()
+                        if status_value == 'watching':
+                            updated_at = float(state.get('updated_at') or 0) or now_ts
+                            stale_at = updated_at + QR_LOGIN_PUSH_SESSION_TTL + 60
+                            if now_ts < stale_at:
+                                continue
+
+                            if not settings.get('retry_enabled', True):
+                                state.update({
+                                    'status': 'expired',
+                                    'last_error': 'watch_stale',
+                                    'next_attempt_at': 0,
+                                })
+                                _save_qr_login_push_series_state(user_id, state)
+                                continue
+
+                            if attempts >= max_attempts:
+                                state.update({
+                                    'status': 'maxed',
+                                    'last_error': 'watch_stale',
+                                    'next_attempt_at': 0,
+                                })
+                                _save_qr_login_push_series_state(user_id, state)
+                                await _notify_qr_push_result(
+                                    user_id,
+                                    settings,
+                                    "闲鱼扫码登录已超过最大提醒次数",
+                                    f"账号 {account_id} 已推送 {attempts}/{max_attempts} 次二维码，仍未完成扫码登录"
+                                )
+                                continue
+
+                            retry_interval = int(settings.get('retry_interval_minutes') or 30)
+                            next_attempt_at = updated_at + QR_LOGIN_PUSH_SESSION_TTL + retry_interval * 60
+                            state.update({
+                                'status': 'waiting_retry',
+                                'last_error': 'watch_stale',
+                                'next_attempt_at': next_attempt_at,
+                            })
+                            _save_qr_login_push_series_state(user_id, state)
+                            if now_ts < next_attempt_at:
+                                continue
+                            status_value = 'waiting_retry'
+
+                        if status_value in ('sent', 'success'):
+                            continue
+                        if status_value == 'maxed' and attempts >= max_attempts:
+                            continue
+                        if status_value == 'expired' and not settings.get('retry_enabled', True):
+                            continue
+                        if attempts >= max_attempts:
+                            state.update({'status': 'maxed', 'next_attempt_at': 0})
+                            _save_qr_login_push_series_state(user_id, state)
+                            continue
+                        next_attempt_at = float(state.get('next_attempt_at') or 0)
+                        if next_attempt_at and now_ts < next_attempt_at:
+                            continue
+
+                        attempt_number = attempts + 1
+                        try:
+                            result = await _create_and_push_qr_login_sessions(
+                                current_user,
+                                settings,
+                                account_ids=[account_id],
+                                auto_retry=True,
+                                attempt_number=attempt_number,
+                                max_attempts=max_attempts,
+                            )
+                            if result.get('success'):
+                                state.update({
+                                    'status': 'watching',
+                                    'attempts': attempt_number,
+                                    'next_attempt_at': 0,
+                                    'last_error': '',
+                                })
+                                pushes = result.get('pushes') or []
+                                if pushes:
+                                    state['last_session_id'] = pushes[0].get('session_id') or ''
+                                _save_qr_login_push_series_state(user_id, state)
+                                logger.info(f"用户 {user_id} 账号 {account_id} 每日扫码登录二维码已推送: {attempt_number}/{max_attempts}")
+                            else:
+                                state.update({
+                                    'status': 'push_failed',
+                                    'last_error': json.dumps(result, ensure_ascii=False)[:500],
+                                    'next_attempt_at': time.time() + 60,
+                                })
+                                _save_qr_login_push_series_state(user_id, state)
+                                logger.error(f"用户 {user_id} 账号 {account_id} 每日扫码登录二维码推送未成功: {result}")
+                        except Exception as exc:
+                            state.update({
+                                'status': 'push_failed',
+                                'last_error': str(exc),
+                                'next_attempt_at': time.time() + 60,
+                            })
+                            _save_qr_login_push_series_state(user_id, state)
+                            logger.error(f"用户 {user_id} 账号 {account_id} 每日扫码登录二维码推送失败: {exc}")
 
                 await asyncio.sleep(30)
             except asyncio.CancelledError:
@@ -711,6 +1010,19 @@ async def _process_pushed_qr_login_cookies(
 
     message = f"账号 {target_account_id} 扫码登录刷新成功"
     await _notify_qr_push_result(user_id, settings, "闲鱼扫码登录已更新", message)
+    try:
+        today_text = datetime.now(ZoneInfo(settings.get('timezone') or 'Asia/Shanghai')).date().isoformat()
+    except Exception:
+        today_text = datetime.now(ZoneInfo('Asia/Shanghai')).date().isoformat()
+    _mark_qr_login_push_account_success(user_id, today_text, target_account_id)
+    state = _get_qr_login_push_series_state(user_id, today_text, target_account_id, settings)
+    state.update({
+        'status': 'success',
+        'next_attempt_at': 0,
+        'last_session_id': session_id,
+        'last_error': '',
+    })
+    _save_qr_login_push_series_state(user_id, state)
     log_with_user('info', f"每日推送扫码登录处理完成: session={session_id}, account={target_account_id}", current_user)
 
     return {
@@ -726,6 +1038,9 @@ async def _watch_pushed_qr_login_session(
     target_account_id: str,
     current_user: Dict[str, Any],
     settings: Dict[str, Any],
+    auto_retry: bool = False,
+    attempt_number: Optional[int] = None,
+    max_attempts: Optional[int] = None,
 ):
     """后台等待每日推送二维码扫码完成，并更新指定账号Cookie。"""
     try:
@@ -758,22 +1073,42 @@ async def _watch_pushed_qr_login_session(
                 return
 
             if status_value in ('expired', 'cancelled', 'not_found'):
-                await _notify_qr_push_result(
-                    int(current_user['user_id']),
-                    settings,
-                    "闲鱼扫码登录未完成",
-                    f"账号 {target_account_id} 二维码状态：{status_value}"
-                )
+                if auto_retry:
+                    await _schedule_qr_login_retry_or_stop(
+                        user_id=int(current_user['user_id']),
+                        target_account_id=target_account_id,
+                        settings=settings,
+                        status_value=status_value,
+                        attempt_number=attempt_number,
+                        max_attempts=max_attempts,
+                    )
+                else:
+                    await _notify_qr_push_result(
+                        int(current_user['user_id']),
+                        settings,
+                        "闲鱼扫码登录未完成",
+                        f"账号 {target_account_id} 二维码状态：{status_value}"
+                    )
                 return
 
             await asyncio.sleep(1.5)
 
-        await _notify_qr_push_result(
-            int(current_user['user_id']),
-            settings,
-            "闲鱼扫码登录已过期",
-            f"账号 {target_account_id} 的二维码5分钟内未完成扫码"
-        )
+        if auto_retry:
+            await _schedule_qr_login_retry_or_stop(
+                user_id=int(current_user['user_id']),
+                target_account_id=target_account_id,
+                settings=settings,
+                status_value='timeout',
+                attempt_number=attempt_number,
+                max_attempts=max_attempts,
+            )
+        else:
+            await _notify_qr_push_result(
+                int(current_user['user_id']),
+                settings,
+                "闲鱼扫码登录已过期",
+                f"账号 {target_account_id} 的二维码5分钟内未完成扫码"
+            )
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -786,6 +1121,65 @@ async def _watch_pushed_qr_login_session(
         logger.error(f"每日推送扫码登录处理异常: session={session_id}, account={target_account_id}, error={exc}")
     finally:
         qr_login_push_watch_tasks.pop(session_id, None)
+
+
+async def _schedule_qr_login_retry_or_stop(
+    user_id: int,
+    target_account_id: str,
+    settings: Dict[str, Any],
+    status_value: str,
+    attempt_number: Optional[int] = None,
+    max_attempts: Optional[int] = None,
+) -> None:
+    try:
+        now_dt = datetime.now(ZoneInfo(settings.get('timezone') or 'Asia/Shanghai'))
+    except Exception:
+        now_dt = datetime.now(ZoneInfo('Asia/Shanghai'))
+    today_text = now_dt.date().isoformat()
+
+    if _was_qr_login_push_account_success(user_id, today_text, target_account_id):
+        return
+
+    state = _get_qr_login_push_series_state(user_id, today_text, target_account_id, settings)
+    max_count = max_attempts or int(settings.get('max_attempts') or 5)
+    current_attempt = attempt_number or int(state.get('attempts') or 1)
+
+    if not settings.get('retry_enabled', True) or current_attempt >= max_count:
+        state.update({
+            'status': 'maxed' if current_attempt >= max_count else 'expired',
+            'last_error': status_value,
+            'next_attempt_at': 0,
+        })
+        _save_qr_login_push_series_state(user_id, state)
+        if current_attempt >= max_count:
+            await _notify_qr_push_result(
+                user_id,
+                settings,
+                "闲鱼扫码登录已超过最大提醒次数",
+                f"账号 {target_account_id} 已推送 {current_attempt}/{max_count} 次二维码，仍未完成扫码登录"
+            )
+        else:
+            await _notify_qr_push_result(
+                user_id,
+                settings,
+                "闲鱼扫码登录已过期",
+                f"账号 {target_account_id} 的二维码5分钟内未完成扫码"
+            )
+        return
+
+    retry_interval = int(settings.get('retry_interval_minutes') or 30)
+    next_attempt_at = time.time() + retry_interval * 60
+    state.update({
+        'status': 'waiting_retry',
+        'last_error': status_value,
+        'next_attempt_at': next_attempt_at,
+    })
+    _save_qr_login_push_series_state(user_id, state)
+    next_time = datetime.fromtimestamp(next_attempt_at).strftime('%Y-%m-%d %H:%M:%S')
+    logger.info(
+        f"用户 {user_id} 账号 {target_account_id} 第 {current_attempt}/{max_count} 次扫码登录二维码未完成，"
+        f"将在 {next_time} 重新推送"
+    )
 
 
 def load_keywords() -> List[Tuple[str, str]]:
@@ -2205,6 +2599,9 @@ class QRLoginPushSettingsIn(BaseModel):
     account_ids: List[str] = Field(default_factory=list)
     channel_ids: List[int] = Field(default_factory=list)
     public_base_url: str = ""
+    retry_enabled: bool = True
+    retry_interval_minutes: int = 30
+    max_attempts: int = 5
 
 
 class QRLoginPushTestIn(BaseModel):

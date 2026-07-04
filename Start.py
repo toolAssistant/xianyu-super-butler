@@ -549,6 +549,7 @@ except Exception as e:
 # ==================== 现在可以安全地导入其他模块 ====================
 import asyncio
 import threading
+import time
 import uvicorn
 from urllib.parse import urlparse
 from loguru import logger
@@ -590,24 +591,31 @@ def _start_api_server():
             host = parsed.hostname
         port = parsed.port or 8080
 
-    logger.info(f"启动Web服务器: http://{host}:{port}")
-    # 在后台线程中创建独立事件循环并直接运行 server.serve()
-    import uvicorn
-    try:
-        config = uvicorn.Config("reply_server:app", host=host, port=port, log_level="info")
-        server = uvicorn.Server(config)
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(server.serve())
-    except Exception as e:
-        logger.error(f"uvicorn服务器启动失败: {e}")
+    retry_delay = 10
+    while True:
+        logger.info(f"启动Web服务器: http://{host}:{port}")
+        loop = None
         try:
-            # 确保线程内事件循环被正确关闭
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.stop()
-        except Exception:
-            pass
+            config = uvicorn.Config("reply_server:app", host=host, port=port, log_level="info")
+            server = uvicorn.Server(config)
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            loop.run_until_complete(server.serve())
+            if getattr(server, "should_exit", False) or getattr(server, "force_exit", False):
+                logger.warning(f"Web服务器已停止，{retry_delay}秒后尝试重启")
+            else:
+                logger.warning(f"Web服务器未保持运行，{retry_delay}秒后尝试重启")
+        except Exception as e:
+            logger.error(f"uvicorn服务器启动失败: {e}，{retry_delay}秒后重试")
+        finally:
+            try:
+                if loop and not loop.is_closed():
+                    loop.close()
+            except Exception as close_error:
+                logger.debug(f"关闭Web服务器事件循环失败: {close_error}")
+            asyncio.set_event_loop(None)
+
+        time.sleep(retry_delay)
 
 
 

@@ -219,6 +219,9 @@ export interface QRLoginPushSettings {
   account_ids: string[];
   channel_ids: number[];
   public_base_url: string;
+  retry_enabled: boolean;
+  retry_interval_minutes: number;
+  max_attempts: number;
 }
 
 // Default Reply

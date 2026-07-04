@@ -36,6 +36,9 @@ const defaultQRSettings: QRLoginPushSettings = {
   account_ids: [],
   channel_ids: [],
   public_base_url: '',
+  retry_enabled: true,
+  retry_interval_minutes: 30,
+  max_attempts: 5,
 };
 
 const defaultChannelForm = {
@@ -662,6 +665,50 @@ const Settings: React.FC = () => {
                   className="w-full ios-input px-4 py-3 rounded-xl text-sm"
                   placeholder="http://你的电脑局域网IP:8080"
                 />
+              </div>
+
+              <div className="space-y-3">
+                <div className="flex items-center justify-between p-4 bg-gray-50 rounded-xl">
+                  <div>
+                    <div className="font-bold text-gray-900">过期自动重试</div>
+                    <div className="text-xs text-gray-500 mt-1">二维码5分钟未扫码后自动重新推送</div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setQrSettings({ ...qrSettings, retry_enabled: !qrSettings.retry_enabled })}
+                    className={`w-14 h-8 rounded-full transition-all relative ${
+                      qrSettings.retry_enabled ? 'bg-[#FFE815]' : 'bg-gray-300'
+                    }`}
+                    title={qrSettings.retry_enabled ? '已启用' : '已停用'}
+                  >
+                    <div className={`w-6 h-6 bg-white rounded-full absolute top-1 transition-all shadow-md ${qrSettings.retry_enabled ? 'left-7' : 'left-1'}`} />
+                  </button>
+                </div>
+
+                <div className="grid grid-cols-2 gap-4">
+                  <div className="space-y-3">
+                    <label className="block text-sm font-bold text-gray-800">重试间隔（分钟）</label>
+                    <input
+                      type="number"
+                      min={5}
+                      max={1440}
+                      value={qrSettings.retry_interval_minutes}
+                      onChange={e => setQrSettings({ ...qrSettings, retry_interval_minutes: Number(e.target.value) })}
+                      className="w-full ios-input px-4 py-3 rounded-xl text-sm"
+                    />
+                  </div>
+                  <div className="space-y-3">
+                    <label className="block text-sm font-bold text-gray-800">最大推送次数</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={20}
+                      value={qrSettings.max_attempts}
+                      onChange={e => setQrSettings({ ...qrSettings, max_attempts: Number(e.target.value) })}
+                      className="w-full ios-input px-4 py-3 rounded-xl text-sm"
+                    />
+                  </div>
+                </div>
               </div>
 
               <div className="space-y-3">
