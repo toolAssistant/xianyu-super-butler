@@ -188,6 +188,39 @@ export interface AIReplySettings {
   custom_prompts: string;
 }
 
+export type NotificationChannelType =
+  | 'qq'
+  | 'ding_talk'
+  | 'dingtalk'
+  | 'feishu'
+  | 'lark'
+  | 'bark'
+  | 'email'
+  | 'webhook'
+  | 'wechat'
+  | 'telegram'
+  | 'serverchan'
+  | 'pushplus';
+
+export interface NotificationChannel {
+  id: string;
+  name: string;
+  type: NotificationChannelType | string;
+  config: Record<string, any>;
+  enabled: boolean;
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface QRLoginPushSettings {
+  enabled: boolean;
+  schedule_time: string;
+  timezone: string;
+  account_ids: string[];
+  channel_ids: number[];
+  public_base_url: string;
+}
+
 // Default Reply
 export interface DefaultReply {
   cookie_id: string;

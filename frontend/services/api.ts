@@ -2,7 +2,8 @@ import { get, post, put, del } from '../request';
 import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
-  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply
+  Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
+  NotificationChannel, QRLoginPushSettings
 } from '../types';
 
 // Auth
@@ -366,7 +367,7 @@ export const testAIConnection = async (cookieId: string): Promise<ApiResponse> =
 }
 
 // Notification Channels
-export const getNotificationChannels = async (): Promise<{ success: boolean; data?: any[] }> => {
+export const getNotificationChannels = async (): Promise<{ success: boolean; data?: NotificationChannel[] }> => {
   const result = await get<any[]>('/notification-channels');
   const channels = (result || []).map((item: any) => {
     let parsedConfig;
@@ -379,7 +380,7 @@ export const getNotificationChannels = async (): Promise<{ success: boolean; dat
       id: String(item.id),
       name: item.name,
       type: item.type,
-      config: parsedConfig,
+      config: parsedConfig || {},
       enabled: item.enabled,
       created_at: item.created_at,
       updated_at: item.updated_at,
@@ -390,21 +391,31 @@ export const getNotificationChannels = async (): Promise<{ success: boolean; dat
 
 export const createNotificationChannel = async (data: { name: string; type: string; config: Record<string, unknown> }): Promise<ApiResponse> => {
   return post('/notification-channels', {
-    ...data,
-    config: JSON.stringify(data.config)
+    ...data
   });
 }
 
-export const updateNotificationChannel = async (channelId: string, data: { name?: string; config?: Record<string, unknown>; enabled?: boolean }): Promise<ApiResponse> => {
-  const payload: Record<string, unknown> = { ...data };
-  if ('config' in data) {
-    payload.config = JSON.stringify(data.config);
-  }
-  return put(`/notification-channels/${channelId}`, payload);
+export const updateNotificationChannel = async (
+  channelId: string,
+  data: { name?: string; type?: string; config?: Record<string, unknown>; enabled?: boolean }
+): Promise<ApiResponse> => {
+  return put(`/notification-channels/${channelId}`, data);
 }
 
 export const deleteNotificationChannel = async (channelId: string): Promise<ApiResponse> => {
   return del(`/notification-channels/${channelId}`);
+}
+
+export const getQRLoginPushSettings = async (): Promise<QRLoginPushSettings> => {
+  return get('/qr-login-push/settings');
+}
+
+export const updateQRLoginPushSettings = async (settings: QRLoginPushSettings): Promise<ApiResponse & { data?: QRLoginPushSettings }> => {
+  return put('/qr-login-push/settings', settings);
+}
+
+export const testQRLoginPush = async (data?: { account_ids?: string[]; channel_ids?: number[] }): Promise<any> => {
+  return post('/qr-login-push/test', data || {});
 }
 
 // Message Notifications

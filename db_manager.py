@@ -6,6 +6,7 @@ import time
 import json
 import random
 import string
+import re
 import aiohttp
 import io
 import base64
@@ -447,7 +448,8 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS notification_channels (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram')),
+                user_id INTEGER NOT NULL DEFAULT 1,
+                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram','serverchan','pushplus')),
                 config TEXT NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -494,6 +496,25 @@ class DBManager:
                 UNIQUE(user_id, key)
             )
             ''')
+
+            # 创建平台确认发货补偿队列表
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS shipment_confirm_retry (
+                order_id TEXT PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                item_id TEXT,
+                buyer_id TEXT,
+                chat_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_shipment_confirm_retry_due ON shipment_confirm_retry(status, next_attempt_at)")
 
             # 创建风控日志表
             cursor.execute('''
@@ -719,6 +740,14 @@ class DBManager:
                 self.set_system_setting("db_version", "1.5", "数据库版本号")
                 logger.info("数据库升级到版本1.5完成")
 
+            # 升级到版本1.6 - 支持Server酱/PushPlus和平台确认发货补偿队列
+            if current_version < "1.6":
+                logger.info("开始升级数据库到版本1.6...")
+                self.upgrade_notification_channels_types(cursor)
+                self.ensure_shipment_confirm_retry_table(cursor)
+                self.set_system_setting("db_version", "1.6", "数据库版本号")
+                logger.info("数据库升级到版本1.6完成")
+
             # 迁移遗留数据（在所有版本升级完成后执行）
             self.migrate_legacy_data(cursor)
 
@@ -846,11 +875,16 @@ class DBManager:
             cursor.execute("SELECT COUNT(*) FROM notification_channels")
             count = cursor.fetchone()[0]
 
-            # 获取现有数据
+            cursor.execute("DROP TABLE IF EXISTS notification_channels_new")
+
+            # 获取现有数据。旧库可能没有 user_id 列，不能依赖 SELECT * 的固定顺序。
             existing_data = []
+            columns = []
             if count > 0:
-                cursor.execute("SELECT * FROM notification_channels")
-                existing_data = cursor.fetchall()
+                cursor.execute("PRAGMA table_info(notification_channels)")
+                columns = [column[1] for column in cursor.fetchall()]
+                cursor.execute(f"SELECT {', '.join(columns)} FROM notification_channels")
+                existing_data = [dict(zip(columns, row)) for row in cursor.fetchall()]
                 logger.info(f"备份 {count} 条通知渠道数据")
 
             # 创建新表，支持所有通知渠道类型
@@ -859,7 +893,7 @@ class DBManager:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 user_id INTEGER NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram')),
+                type TEXT NOT NULL CHECK (type IN ('qq','ding_talk','dingtalk','feishu','lark','bark','email','webhook','wechat','telegram','serverchan','pushplus')),
                 config TEXT NOT NULL,
                 enabled BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -870,28 +904,19 @@ class DBManager:
             # 复制数据，同时处理类型映射
             if existing_data:
                 logger.info(f"迁移 {len(existing_data)} 条通知渠道数据到新表")
-                for row in existing_data:
+                for record in existing_data:
                     # 处理类型映射，支持更多渠道类型
-                    old_type = row[3] if len(row) > 3 else 'qq'  # type字段
-
-                    # 完整的类型映射规则，支持所有通知渠道
-                    type_mapping = {
-                        'ding_talk': 'dingtalk',  # 统一为dingtalk
-                        'dingtalk': 'dingtalk',
-                        'qq': 'qq',
-                        'feishu': 'feishu',      # 飞书通知
-                        'lark': 'lark',          # 飞书通知（英文名）
-                        'bark': 'bark',          # Bark通知
-                        'email': 'email',        # 邮件通知
-                        'webhook': 'webhook',    # Webhook通知
-                        'wechat': 'wechat',      # 微信通知
-                        'telegram': 'telegram'   # Telegram通知
-                    }
-
-                    new_type = type_mapping.get(old_type, 'qq')  # 默认为qq
+                    old_type = record.get('type') or 'qq'
+                    new_type = self._normalize_channel_type(old_type)
 
                     if old_type != new_type:
                         logger.info(f"转换通知渠道类型: {old_type} -> {new_type}")
+
+                    user_id = record.get('user_id')
+                    if user_id is None:
+                        cursor.execute("SELECT id FROM users WHERE username = 'admin'")
+                        admin_user = cursor.fetchone()
+                        user_id = admin_user[0] if admin_user else 1
 
                     # 插入到新表，确保字段完整性
                     cursor.execute('''
@@ -899,14 +924,14 @@ class DBManager:
                     (id, name, user_id, type, config, enabled, created_at, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (
-                        row[0],  # id
-                        row[1],  # name
-                        row[2],  # user_id
-                        new_type,  # type (转换后的)
-                        row[4] if len(row) > 4 else '{}',  # config
-                        row[5] if len(row) > 5 else True,  # enabled
-                        row[6] if len(row) > 6 else None,  # created_at
-                        row[7] if len(row) > 7 else None   # updated_at
+                        record.get('id'),
+                        record.get('name') or '未命名通知渠道',
+                        user_id,
+                        new_type,
+                        record.get('config') or '{}',
+                        record.get('enabled', True),
+                        record.get('created_at'),
+                        record.get('updated_at')
                     ))
 
             # 删除旧表
@@ -925,9 +950,36 @@ class DBManager:
             logger.info("   - webhook (Webhook通知)")
             logger.info("   - wechat (微信通知)")
             logger.info("   - telegram (Telegram通知)")
+            logger.info("   - serverchan (Server酱通知)")
+            logger.info("   - pushplus (PushPlus通知)")
             return True
         except Exception as e:
             logger.error(f"升级notification_channels表类型失败: {e}")
+            raise
+
+    def ensure_shipment_confirm_retry_table(self, cursor):
+        """确保平台确认发货补偿队列表存在。"""
+        try:
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS shipment_confirm_retry (
+                order_id TEXT PRIMARY KEY,
+                cookie_id TEXT NOT NULL,
+                item_id TEXT,
+                buyer_id TEXT,
+                chat_id TEXT,
+                status TEXT NOT NULL DEFAULT 'pending',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                next_attempt_at REAL NOT NULL,
+                last_error TEXT,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_shipment_confirm_retry_due ON shipment_confirm_retry(status, next_attempt_at)")
+            return True
+        except Exception as e:
+            logger.error(f"创建平台确认发货补偿队列表失败: {e}")
             raise
 
     def upgrade_cookies_table_for_account_login(self, cursor):
@@ -1037,16 +1089,23 @@ class DBManager:
             'ding_talk': 'dingtalk',
             'dingtalk': 'dingtalk',
             'qq': 'qq',
+            'feishu': 'feishu',
+            'lark': 'lark',
+            'bark': 'bark',
             'email': 'email',
             'webhook': 'webhook',
             'wechat': 'wechat',
             'telegram': 'telegram',
+            'serverchan': 'serverchan',
+            'server_chan': 'serverchan',
+            'server酱': 'serverchan',
+            'pushplus': 'pushplus',
             # 处理一些可能的变体
             'dingding': 'dingtalk',
             'weixin': 'wechat',
             'tg': 'telegram'
         }
-        return type_mapping.get(old_type.lower(), 'qq')
+        return type_mapping.get(str(old_type or '').lower(), 'qq')
     
     def _migrate_keywords_table_constraints(self, cursor):
         """迁移keywords表的约束，支持基于商品ID的唯一性校验"""
@@ -2071,10 +2130,11 @@ class DBManager:
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                normalized_type = self._normalize_channel_type(channel_type)
                 cursor.execute('''
                 INSERT INTO notification_channels (name, type, config, user_id)
                 VALUES (?, ?, ?, ?)
-                ''', (name, channel_type, config, user_id))
+                ''', (name, normalized_type, config, user_id))
                 self.conn.commit()
                 channel_id = cursor.lastrowid
                 logger.debug(f"创建通知渠道: {name} (ID: {channel_id})")
@@ -2091,14 +2151,14 @@ class DBManager:
                 cursor = self.conn.cursor()
                 if user_id is not None:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, user_id, type, config, enabled, created_at, updated_at
                     FROM notification_channels
                     WHERE user_id = ?
                     ORDER BY created_at DESC
                     ''', (user_id,))
                 else:
                     cursor.execute('''
-                    SELECT id, name, type, config, enabled, created_at, updated_at
+                    SELECT id, name, user_id, type, config, enabled, created_at, updated_at
                     FROM notification_channels
                     ORDER BY created_at DESC
                     ''')
@@ -2108,11 +2168,12 @@ class DBManager:
                     channels.append({
                         'id': row[0],
                         'name': row[1],
-                        'type': row[2],
-                        'config': row[3],
-                        'enabled': bool(row[4]),
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'user_id': row[2],
+                        'type': row[3],
+                        'config': row[4],
+                        'enabled': bool(row[5]),
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     })
 
                 return channels
@@ -2126,7 +2187,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, name, type, config, enabled, created_at, updated_at
+                SELECT id, name, user_id, type, config, enabled, created_at, updated_at
                 FROM notification_channels WHERE id = ?
                 ''', (channel_id,))
 
@@ -2135,27 +2196,36 @@ class DBManager:
                     return {
                         'id': row[0],
                         'name': row[1],
-                        'type': row[2],
-                        'config': row[3],
-                        'enabled': bool(row[4]),
-                        'created_at': row[5],
-                        'updated_at': row[6]
+                        'user_id': row[2],
+                        'type': row[3],
+                        'config': row[4],
+                        'enabled': bool(row[5]),
+                        'created_at': row[6],
+                        'updated_at': row[7]
                     }
                 return None
             except Exception as e:
                 logger.error(f"获取通知渠道失败: {e}")
                 return None
 
-    def update_notification_channel(self, channel_id: int, name: str, config: str, enabled: bool = True) -> bool:
+    def update_notification_channel(self, channel_id: int, name: str, config: str,
+                                    enabled: bool = True, channel_type: str = None) -> bool:
         """更新通知渠道"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                cursor.execute('''
-                UPDATE notification_channels
-                SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
-                ''', (name, config, enabled, channel_id))
+                if channel_type is not None:
+                    cursor.execute('''
+                    UPDATE notification_channels
+                    SET name = ?, type = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''', (name, self._normalize_channel_type(channel_type), config, enabled, channel_id))
+                else:
+                    cursor.execute('''
+                    UPDATE notification_channels
+                    SET name = ?, config = ?, enabled = ?, updated_at = CURRENT_TIMESTAMP
+                    WHERE id = ?
+                    ''', (name, config, enabled, channel_id))
                 self.conn.commit()
                 logger.debug(f"更新通知渠道: {channel_id}")
                 return cursor.rowcount > 0
@@ -3326,10 +3396,126 @@ class DBManager:
                         'spec_value': row[18]
                     })
 
-                return rules
+                if rules:
+                    return rules
+
+                return self._get_fuzzy_delivery_rules(keyword)
             except Exception as e:
                 logger.error(f"根据关键字获取发货规则失败: {e}")
                 return []
+
+    def _normalize_delivery_match_text(self, text: str) -> str:
+        """Normalize item/rule text for delivery matching."""
+        if not text:
+            return ''
+        return re.sub(r'[^\w\u4e00-\u9fff]+', '', str(text).lower())
+
+    def _delivery_match_score(self, search_text: str, rule_keyword: str) -> int:
+        """Return a positive score when a delivery rule should match search text."""
+        if not search_text or not rule_keyword:
+            return 0
+
+        search_raw = str(search_text).lower()
+        keyword_raw = str(rule_keyword).lower()
+        if keyword_raw in search_raw:
+            return 10000 + len(keyword_raw)
+        if search_raw in keyword_raw:
+            return 5000 + len(search_raw)
+
+        search_norm = self._normalize_delivery_match_text(search_text)
+        keyword_norm = self._normalize_delivery_match_text(rule_keyword)
+        if not search_norm or not keyword_norm:
+            return 0
+
+        if keyword_norm in search_norm:
+            return 9000 + len(keyword_norm)
+        if search_norm in keyword_norm:
+            return 4500 + len(search_norm)
+
+        # Many item titles keep only the English product name while the rule
+        # stores a longer Chinese title, e.g. "Obsidian + Claude Code 用AI...".
+        # Match the leading alphanumeric product phrase after punctuation and
+        # whitespace normalization, but keep the score below full matches.
+        leading_product = re.match(r'^[a-z0-9]{6,}', keyword_norm)
+        if leading_product and leading_product.group(0) in search_norm:
+            return 3000 + len(leading_product.group(0))
+
+        return 0
+
+    def _delivery_rule_from_row(self, row):
+        """Convert a delivery rule query row to API dict."""
+        api_config = row[9]
+        if api_config:
+            try:
+                api_config = json.loads(api_config)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        return {
+            'id': row[0],
+            'keyword': row[1],
+            'card_id': row[2],
+            'delivery_count': row[3],
+            'enabled': bool(row[4]),
+            'description': row[5],
+            'delivery_times': row[6] or 0,
+            'card_name': row[7],
+            'card_type': row[8],
+            'api_config': api_config,
+            'text_content': row[10],
+            'data_content': row[11],
+            'image_url': row[12],
+            'card_enabled': bool(row[13]),
+            'card_description': row[14],
+            'card_delay_seconds': row[15] or 0,
+            'is_multi_spec': bool(row[16]) if row[16] is not None else False,
+            'spec_name': row[17],
+            'spec_value': row[18]
+        }
+
+    def _get_fuzzy_delivery_rules(self, keyword: str, multi_spec: bool = None,
+                                  spec_name: str = None, spec_value: str = None):
+        """Fallback delivery rule matching with normalized text."""
+        cursor = self.conn.cursor()
+        conditions = ["dr.enabled = 1", "c.enabled = 1"]
+        params = []
+
+        if multi_spec is True:
+            conditions.append("c.is_multi_spec = 1")
+            if spec_name is not None and spec_value is not None:
+                conditions.append("c.spec_name = ?")
+                conditions.append("c.spec_value = ?")
+                params.extend([spec_name, spec_value])
+        elif multi_spec is False:
+            conditions.append("(c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)")
+
+        cursor.execute(f'''
+        SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+               dr.description, dr.delivery_times,
+               c.name as card_name, c.type as card_type, c.api_config,
+               c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+               c.delay_seconds as card_delay_seconds,
+               c.is_multi_spec, c.spec_name, c.spec_value
+        FROM delivery_rules dr
+        LEFT JOIN cards c ON dr.card_id = c.id
+        WHERE {' AND '.join(conditions)}
+        ''', params)
+
+        scored_rules = []
+        for row in cursor.fetchall():
+            score = self._delivery_match_score(keyword, row[1])
+            if score > 0:
+                scored_rules.append((score, row[6] or 0, row[0], self._delivery_rule_from_row(row)))
+
+        scored_rules.sort(key=lambda item: (-item[0], item[1], item[2]))
+        if not scored_rules:
+            return []
+
+        best_score = scored_rules[0][0]
+        rules = [item[3] for item in scored_rules if item[0] == best_score]
+        if rules:
+            logger.info(f"规范化匹配到发货规则: {keyword[:80]} -> {[r['keyword'] for r in rules]}")
+        return rules
 
     def get_delivery_rule_by_id(self, rule_id: int, user_id: int = None):
         """根据ID获取发货规则（支持用户隔离）"""
@@ -4626,6 +4812,97 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    def try_claim_order_delivery(self, order_id: str, cookie_id: str = None,
+                                 item_id: str = None, buyer_id: str = None,
+                                 chat_id: str = None) -> bool:
+        """Atomically claim an order for delivery to prevent duplicate card sending."""
+        if not order_id:
+            return False
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+
+                if cookie_id:
+                    cursor.execute("SELECT id FROM cookies WHERE id = ?", (cookie_id,))
+                    if not cursor.fetchone():
+                        logger.warning(f"Cookie ID {cookie_id} 不存在，无法抢占订单发货: {order_id}")
+                        return False
+
+                cursor.execute('''
+                INSERT OR IGNORE INTO orders (
+                    order_id, item_id, buyer_id, order_status, cookie_id, system_shipped, chat_id
+                ) VALUES (?, ?, ?, 'pending_ship', ?, 0, ?)
+                ''', (order_id, item_id, buyer_id, cookie_id, chat_id or ''))
+
+                cursor.execute('''
+                UPDATE orders
+                SET system_shipped = 1,
+                    item_id = CASE WHEN (item_id IS NULL OR item_id = '') AND ? IS NOT NULL THEN ? ELSE item_id END,
+                    buyer_id = CASE WHEN (buyer_id IS NULL OR buyer_id = '') AND ? IS NOT NULL THEN ? ELSE buyer_id END,
+                    cookie_id = CASE WHEN (cookie_id IS NULL OR cookie_id = '') AND ? IS NOT NULL THEN ? ELSE cookie_id END,
+                    chat_id = CASE WHEN (chat_id IS NULL OR chat_id = '') AND ? IS NOT NULL THEN ? ELSE chat_id END,
+                    updated_at = CURRENT_TIMESTAMP,
+                    version = version + 1
+                WHERE order_id = ?
+                  AND COALESCE(system_shipped, 0) = 0
+                  AND (? IS NULL OR cookie_id IS NULL OR cookie_id = '' OR cookie_id = ?)
+                ''', (
+                    item_id, item_id,
+                    buyer_id, buyer_id,
+                    cookie_id, cookie_id,
+                    chat_id, chat_id,
+                    order_id,
+                    cookie_id, cookie_id
+                ))
+
+                claimed = cursor.rowcount > 0
+                self.conn.commit()
+
+                if claimed:
+                    logger.info(f"订单 {order_id} 已抢占发货处理，阻止重复发送")
+                else:
+                    logger.warning(f"订单 {order_id} 已被处理或正在处理，跳过重复发货")
+
+                return claimed
+
+            except Exception as e:
+                logger.error(f"抢占订单发货失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
+    def release_order_delivery_claim(self, order_id: str, cookie_id: str = None) -> bool:
+        """Release a delivery claim when no card content was sent."""
+        if not order_id:
+            return False
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if cookie_id:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET system_shipped = 0, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                    WHERE order_id = ? AND cookie_id = ?
+                    ''', (order_id, cookie_id))
+                else:
+                    cursor.execute('''
+                    UPDATE orders
+                    SET system_shipped = 0, updated_at = CURRENT_TIMESTAMP, version = version + 1
+                    WHERE order_id = ?
+                    ''', (order_id,))
+
+                released = cursor.rowcount > 0
+                self.conn.commit()
+                if released:
+                    logger.info(f"订单 {order_id} 发货占位已释放")
+                return released
+
+            except Exception as e:
+                logger.error(f"释放订单发货占位失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
     def get_order_by_id(self, order_id: str):
         """根据订单ID获取订单信息"""
         with self.lock:
@@ -4799,6 +5076,151 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取所有订单列表失败: {e}")
                 return []
+
+    # -------------------- 平台确认发货补偿队列 --------------------
+    def enqueue_shipment_confirm_retry(self, order_id: str, cookie_id: str,
+                                       item_id: str = None, buyer_id: str = None,
+                                       chat_id: str = None, last_error: str = None,
+                                       delay_seconds: int = 300) -> bool:
+        """添加或更新平台确认发货补偿任务。"""
+        if not order_id or not cookie_id:
+            return False
+
+        now = time.time()
+        next_attempt_at = now + max(0, int(delay_seconds or 0))
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO shipment_confirm_retry (
+                    order_id, cookie_id, item_id, buyer_id, chat_id, status,
+                    attempts, next_attempt_at, last_error, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)
+                ON CONFLICT(order_id) DO UPDATE SET
+                    cookie_id = excluded.cookie_id,
+                    item_id = COALESCE(excluded.item_id, shipment_confirm_retry.item_id),
+                    buyer_id = COALESCE(excluded.buyer_id, shipment_confirm_retry.buyer_id),
+                    chat_id = COALESCE(excluded.chat_id, shipment_confirm_retry.chat_id),
+                    status = CASE
+                        WHEN shipment_confirm_retry.status = 'succeeded' THEN shipment_confirm_retry.status
+                        ELSE 'pending'
+                    END,
+                    next_attempt_at = CASE
+                        WHEN shipment_confirm_retry.status = 'succeeded' THEN shipment_confirm_retry.next_attempt_at
+                        ELSE MIN(shipment_confirm_retry.next_attempt_at, excluded.next_attempt_at)
+                    END,
+                    last_error = excluded.last_error,
+                    updated_at = excluded.updated_at
+                ''', (
+                    order_id, cookie_id, item_id, buyer_id, chat_id,
+                    next_attempt_at, last_error or '', now, now
+                ))
+                self.conn.commit()
+                logger.info(f"平台确认发货补偿任务已入队: {order_id}, next_attempt_at={next_attempt_at}")
+                return True
+            except Exception as e:
+                logger.error(f"平台确认发货补偿任务入队失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
+    def get_due_shipment_confirm_retries(self, cookie_id: str = None,
+                                         now: float = None, limit: int = 20) -> List[Dict[str, any]]:
+        """获取到期的平台确认发货补偿任务。"""
+        now = now or time.time()
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if cookie_id:
+                    cursor.execute('''
+                    SELECT order_id, cookie_id, item_id, buyer_id, chat_id, status,
+                           attempts, next_attempt_at, last_error, created_at, updated_at
+                    FROM shipment_confirm_retry
+                    WHERE status = 'pending' AND cookie_id = ? AND next_attempt_at <= ?
+                    ORDER BY next_attempt_at ASC
+                    LIMIT ?
+                    ''', (cookie_id, now, limit))
+                else:
+                    cursor.execute('''
+                    SELECT order_id, cookie_id, item_id, buyer_id, chat_id, status,
+                           attempts, next_attempt_at, last_error, created_at, updated_at
+                    FROM shipment_confirm_retry
+                    WHERE status = 'pending' AND next_attempt_at <= ?
+                    ORDER BY next_attempt_at ASC
+                    LIMIT ?
+                    ''', (now, limit))
+
+                tasks = []
+                for row in cursor.fetchall():
+                    tasks.append({
+                        'order_id': row[0],
+                        'cookie_id': row[1],
+                        'item_id': row[2],
+                        'buyer_id': row[3],
+                        'chat_id': row[4],
+                        'status': row[5],
+                        'attempts': row[6] or 0,
+                        'next_attempt_at': row[7],
+                        'last_error': row[8] or '',
+                        'created_at': row[9],
+                        'updated_at': row[10],
+                    })
+                return tasks
+            except Exception as e:
+                logger.error(f"获取平台确认发货补偿任务失败: {e}")
+                return []
+
+    def mark_shipment_confirm_retry_success(self, order_id: str) -> bool:
+        """标记平台确认发货补偿任务成功。"""
+        return self._update_shipment_confirm_retry_status(order_id, 'succeeded')
+
+    def mark_shipment_confirm_retry_failed(self, order_id: str, error: str = None) -> bool:
+        """标记平台确认发货补偿任务失败。"""
+        return self._update_shipment_confirm_retry_status(order_id, 'failed', error)
+
+    def postpone_shipment_confirm_retry(self, order_id: str, error: str = None,
+                                        delay_seconds: int = 300) -> bool:
+        """推迟平台确认发货补偿任务。"""
+        if not order_id:
+            return False
+
+        now = time.time()
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                UPDATE shipment_confirm_retry
+                SET attempts = attempts + 1,
+                    next_attempt_at = ?,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE order_id = ? AND status = 'pending'
+                ''', (now + max(0, int(delay_seconds or 0)), error or '', now, order_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"推迟平台确认发货补偿任务失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
+
+    def _update_shipment_confirm_retry_status(self, order_id: str, status: str,
+                                              error: str = None) -> bool:
+        if not order_id:
+            return False
+
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                UPDATE shipment_confirm_retry
+                SET status = ?, last_error = COALESCE(?, last_error), updated_at = ?
+                WHERE order_id = ?
+                ''', (status, error, time.time(), order_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"更新平台确认发货补偿任务状态失败: {order_id} - {e}")
+                self.conn.rollback()
+                return False
 
     def delete_table_record(self, table_name: str, record_id: str):
         """删除指定表的指定记录"""

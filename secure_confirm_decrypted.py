@@ -54,6 +54,12 @@ class SecureConfirm:
             'Session过期',
             'FAIL_SYS_TOKEN_EXOIRED',
             'FAIL_SYS_TOKEN_EXPIRED',
+            'FAIL_SYS_ILLEGAL_ACCESS',
+            'FAIL_SYS_USER_VALIDATE',
+            'RGV587_ERROR',
+            '非法请求',
+            '风控',
+            '验证',
             '令牌过期',
         ]
         return any(keyword in error_msg for keyword in invalid_keywords)

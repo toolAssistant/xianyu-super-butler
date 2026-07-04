@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Body, Query, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi import Response, Cookie
@@ -7,6 +7,9 @@ from pydantic import BaseModel, Field
 from typing import List, Tuple, Optional, Dict, Any
 from pathlib import Path
 from urllib.parse import unquote
+from datetime import datetime
+from zoneinfo import ZoneInfo
+import html
 import hashlib
 import secrets
 import time
@@ -44,9 +47,25 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
 
+
+def _get_env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None:
+        return default
+
+    try:
+        parsed = int(value)
+        if parsed <= 0:
+            raise ValueError
+        return parsed
+    except ValueError:
+        logger.warning(f"环境变量 {name}={value!r} 无效，回退默认值 {default}")
+        return default
+
+
 # Session Cookie 配置（安全优先）
 SESSION_COOKIE_NAME = "session"
-SESSION_EXPIRE_SECONDS = 24 * 60 * 60
+SESSION_EXPIRE_SECONDS = _get_env_int('SESSION_EXPIRE_SECONDS', 7 * 24 * 60 * 60)
 
 
 def _get_db_path() -> str:
@@ -119,6 +138,29 @@ def _delete_session(session_id: str) -> None:
         conn.close()
 
 
+def _refresh_session_expiry(session_id: str, now: Optional[int] = None) -> Optional[int]:
+    if not session_id:
+        return None
+
+    _init_sessions_table_if_needed()
+    current_time = int(now if now is not None else time.time())
+    expires_at = current_time + SESSION_EXPIRE_SECONDS
+
+    conn = sqlite3.connect(_get_db_path(), check_same_thread=False)
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE sessions SET expires_at = ? WHERE session_id = ?",
+            (int(expires_at), session_id),
+        )
+        conn.commit()
+        if cursor.rowcount <= 0:
+            return None
+        return int(expires_at)
+    finally:
+        conn.close()
+
+
 def _get_session(session_id: str) -> Optional[Dict[str, Any]]:
     if not session_id:
         return None
@@ -147,6 +189,7 @@ def _get_session(session_id: str) -> Optional[Dict[str, Any]]:
             'user_id': int(row[1]),
             'username': row[2],
             'is_admin': bool(row[3]),
+            'expires_at': expires_at,
             'timestamp': float(now),
         }
     finally:
@@ -164,6 +207,22 @@ def get_current_user_from_session_cookie(session: Optional[str] = Cookie(default
 qr_check_locks = defaultdict(lambda: asyncio.Lock())
 qr_check_processed = {}  # 记录扫码处理状态: {session_id: {'status': str, 'timestamp': float, ...}}
 qr_check_tasks = {}  # 后台扫码处理任务: {session_id: asyncio.Task}
+
+# 每日扫码登录推送配置与会话
+QR_LOGIN_PUSH_SETTING_KEY = "qr_login_push_settings"
+QR_LOGIN_PUSH_DEFAULTS = {
+    "enabled": False,
+    "schedule_time": "09:00",
+    "timezone": "Asia/Shanghai",
+    "account_ids": [],
+    "channel_ids": [],
+    "public_base_url": "",
+}
+QR_LOGIN_PUSH_SESSION_TTL = 300
+qr_mobile_tokens = {}  # {session_id: {'token': str, 'user_id': int, 'account_id': str, 'expires_at': float}}
+qr_login_push_task = None
+qr_login_push_sent_dates = set()
+qr_login_push_watch_tasks = {}
 
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
@@ -214,6 +273,362 @@ def _build_qr_status_response(session_id: str) -> Optional[Dict[str, Any]]:
     return response
 
 
+def _serialize_channel_config(config: Any) -> str:
+    if isinstance(config, str):
+        return config
+    return json.dumps(config or {}, ensure_ascii=False)
+
+
+def _parse_channel_config(config: Any) -> Dict[str, Any]:
+    if isinstance(config, dict):
+        return config
+    if isinstance(config, str):
+        try:
+            parsed = json.loads(config)
+            return parsed if isinstance(parsed, dict) else {"config": config}
+        except json.JSONDecodeError:
+            return {"config": config}
+    return {}
+
+
+def _model_to_dict(model: BaseModel) -> Dict[str, Any]:
+    if hasattr(model, 'model_dump'):
+        return model.model_dump()
+    return model.dict()
+
+
+def _normalize_qr_login_push_settings(raw_settings: Any = None) -> Dict[str, Any]:
+    settings = dict(QR_LOGIN_PUSH_DEFAULTS)
+    if isinstance(raw_settings, str) and raw_settings.strip():
+        try:
+            raw_settings = json.loads(raw_settings)
+        except json.JSONDecodeError:
+            raw_settings = {}
+    if isinstance(raw_settings, dict):
+        settings.update(raw_settings)
+
+    settings['enabled'] = bool(settings.get('enabled', False))
+    settings['schedule_time'] = str(settings.get('schedule_time') or '09:00')[:5]
+    if not re.fullmatch(r'\d{2}:\d{2}', settings['schedule_time']):
+        settings['schedule_time'] = '09:00'
+    settings['timezone'] = str(settings.get('timezone') or 'Asia/Shanghai')
+    settings['account_ids'] = [str(item) for item in settings.get('account_ids') or [] if str(item)]
+    settings['channel_ids'] = [
+        int(item) for item in settings.get('channel_ids') or []
+        if str(item).isdigit()
+    ]
+    settings['public_base_url'] = str(settings.get('public_base_url') or '').strip().rstrip('/')
+    return settings
+
+
+def _load_qr_login_push_settings(user_id: int) -> Dict[str, Any]:
+    setting = db_manager.get_user_setting(user_id, QR_LOGIN_PUSH_SETTING_KEY)
+    raw_value = setting.get('value') if setting else None
+    return _normalize_qr_login_push_settings(raw_value)
+
+
+def _save_qr_login_push_settings(user_id: int, settings: Dict[str, Any]) -> bool:
+    normalized = _normalize_qr_login_push_settings(settings)
+    return db_manager.set_user_setting(
+        user_id,
+        QR_LOGIN_PUSH_SETTING_KEY,
+        json.dumps(normalized, ensure_ascii=False),
+        "每日扫码登录二维码推送配置"
+    )
+
+
+def _validate_qr_login_push_settings(settings: Dict[str, Any], user_id: int) -> Dict[str, Any]:
+    normalized = _normalize_qr_login_push_settings(settings)
+    hour, minute = [int(part) for part in normalized['schedule_time'].split(':')]
+    if hour > 23 or minute > 59:
+        raise HTTPException(status_code=400, detail="推送时间必须是 HH:MM 格式")
+
+    try:
+        ZoneInfo(normalized['timezone'])
+    except Exception:
+        raise HTTPException(status_code=400, detail="无效的时区")
+
+    user_cookies = db_manager.get_all_cookies(user_id)
+    invalid_accounts = [account_id for account_id in normalized['account_ids'] if account_id not in user_cookies]
+    if invalid_accounts:
+        raise HTTPException(status_code=403, detail=f"无权访问账号: {', '.join(invalid_accounts)}")
+
+    user_channels = {
+        int(channel['id']): channel for channel in db_manager.get_notification_channels(user_id)
+    }
+    invalid_channels = [
+        channel_id for channel_id in normalized['channel_ids']
+        if channel_id not in user_channels
+    ]
+    if invalid_channels:
+        raise HTTPException(status_code=403, detail=f"无权访问通知渠道: {invalid_channels}")
+
+    unsupported_channels = [
+        channel_id for channel_id in normalized['channel_ids']
+        if (user_channels[channel_id].get('type') or '').lower() not in ('serverchan', 'pushplus')
+    ]
+    if unsupported_channels:
+        raise HTTPException(status_code=400, detail=f"扫码推送仅支持Server酱/PushPlus渠道: {unsupported_channels}")
+
+    return normalized
+
+
+def _build_public_base_url(request: Optional[Request], configured_base_url: str) -> str:
+    if configured_base_url:
+        return configured_base_url.rstrip('/')
+    if request is not None:
+        return str(request.base_url).rstrip('/')
+    return os.getenv('PUBLIC_BASE_URL', '').rstrip('/')
+
+
+def _make_mobile_qr_url(base_url: str, session_id: str, token: str) -> str:
+    return f"{base_url.rstrip('/')}/qr-login/mobile/{session_id}?token={token}"
+
+
+async def _send_qr_push_channel(channel: Dict[str, Any], title: str, content: str) -> Dict[str, Any]:
+    import aiohttp
+
+    config = _parse_channel_config(channel.get('config'))
+    channel_type = (channel.get('type') or '').lower()
+
+    if channel_type == 'serverchan':
+        sendkey = (config.get('sendkey') or config.get('serverchan_sendkey') or config.get('config') or '').strip()
+        if not sendkey:
+            return {'success': False, 'message': 'Server酱 sendkey 为空'}
+        api_url = f"https://sctapi.ftqq.com/{sendkey}.send"
+        async with aiohttp.ClientSession() as session:
+            async with session.post(api_url, data={'title': title, 'desp': content}, timeout=10) as response:
+                text = await response.text()
+                return {'success': response.status == 200, 'status': response.status, 'message': text[:300]}
+
+    if channel_type == 'pushplus':
+        token = (config.get('token') or config.get('config') or '').strip()
+        if not token:
+            return {'success': False, 'message': 'PushPlus token 为空'}
+        payload = {
+            'token': token,
+            'title': title,
+            'content': content,
+            'template': config.get('template') or 'html',
+        }
+        for key in ('topic', 'channel', 'webhook', 'callbackUrl', 'to', 'timestamp'):
+            value = config.get(key)
+            if value not in (None, ''):
+                payload[key] = value
+        async with aiohttp.ClientSession() as session:
+            async with session.post('http://www.pushplus.plus/send', json=payload, timeout=10) as response:
+                text = await response.text()
+                return {'success': response.status == 200, 'status': response.status, 'message': text[:300]}
+
+    return {'success': False, 'message': f"不支持扫码推送渠道: {channel_type}"}
+
+
+async def _send_qr_login_push_notice(user_id: int, channel_ids: List[int], title: str, content: str) -> List[Dict[str, Any]]:
+    user_channels = {
+        int(channel['id']): channel
+        for channel in db_manager.get_notification_channels(user_id)
+        if channel.get('enabled')
+    }
+    results = []
+    for channel_id in channel_ids:
+        channel = user_channels.get(int(channel_id))
+        if not channel:
+            results.append({'channel_id': channel_id, 'success': False, 'message': '通知渠道不存在或未启用'})
+            continue
+        try:
+            result = await _send_qr_push_channel(channel, title, content)
+            result['channel_id'] = channel_id
+            results.append(result)
+        except Exception as exc:
+            results.append({'channel_id': channel_id, 'success': False, 'message': str(exc)})
+            logger.error(f"扫码二维码推送失败: channel_id={channel_id}, error={exc}")
+    return results
+
+
+async def _notify_qr_push_result(user_id: int, settings: Dict[str, Any], title: str, message: str):
+    channel_ids = settings.get('channel_ids') or []
+    if not channel_ids:
+        return
+    content = f"<p>{html.escape(message)}</p><p>时间：{html.escape(datetime.now().strftime('%Y-%m-%d %H:%M:%S'))}</p>"
+    await _send_qr_login_push_notice(user_id, channel_ids, title, content)
+
+
+def _get_cookie_unb(cookie_value: str) -> Optional[str]:
+    try:
+        cookie_dict = trans_cookies(cookie_value or '')
+        return cookie_dict.get('unb')
+    except Exception:
+        return None
+
+
+async def _create_and_push_qr_login_sessions(
+    user: Dict[str, Any],
+    settings: Dict[str, Any],
+    request: Optional[Request] = None,
+    account_ids: Optional[List[str]] = None,
+    channel_ids: Optional[List[int]] = None,
+) -> Dict[str, Any]:
+    user_id = int(user['user_id'])
+    settings_candidate = _normalize_qr_login_push_settings(settings)
+    if account_ids is not None:
+        settings_candidate['account_ids'] = account_ids
+    if channel_ids is not None:
+        settings_candidate['channel_ids'] = channel_ids
+    normalized = _validate_qr_login_push_settings(settings_candidate, user_id)
+
+    selected_accounts = normalized.get('account_ids', [])
+    selected_channels = normalized.get('channel_ids', [])
+    selected_accounts = [str(account_id) for account_id in selected_accounts if str(account_id)]
+    selected_channels = [int(channel_id) for channel_id in selected_channels if str(channel_id).isdigit()]
+
+    if not selected_accounts:
+        raise HTTPException(status_code=400, detail="请至少选择一个账号")
+    if not selected_channels:
+        raise HTTPException(status_code=400, detail="请至少选择一个Server酱或PushPlus通知渠道")
+
+    user_cookies = db_manager.get_all_cookies(user_id)
+    invalid_accounts = [account_id for account_id in selected_accounts if account_id not in user_cookies]
+    if invalid_accounts:
+        raise HTTPException(status_code=403, detail=f"无权访问账号: {', '.join(invalid_accounts)}")
+
+    user_channels = {
+        int(channel['id']): channel for channel in db_manager.get_notification_channels(user_id)
+    }
+    invalid_channels = [
+        channel_id for channel_id in selected_channels
+        if channel_id not in user_channels
+    ]
+    if invalid_channels:
+        raise HTTPException(status_code=403, detail=f"无权访问通知渠道: {invalid_channels}")
+
+    unsupported_channels = [
+        channel_id for channel_id in selected_channels
+        if (user_channels[channel_id].get('type') or '').lower() not in ('serverchan', 'pushplus')
+    ]
+    if unsupported_channels:
+        raise HTTPException(status_code=400, detail=f"扫码推送仅支持Server酱/PushPlus渠道: {unsupported_channels}")
+
+    base_url = _build_public_base_url(request, normalized.get('public_base_url', ''))
+    if not base_url:
+        raise HTTPException(status_code=400, detail="请配置可从手机访问的访问基地址")
+
+    pushes = []
+    for account_id in selected_accounts:
+        result = await qr_login_manager.generate_qr_code()
+        if not result.get('success'):
+            pushes.append({
+                'account_id': account_id,
+                'success': False,
+                'message': result.get('message', '二维码生成失败')
+            })
+            continue
+
+        session_id = result['session_id']
+        token = secrets.token_urlsafe(24)
+        expires_at = time.time() + QR_LOGIN_PUSH_SESSION_TTL
+        qr_mobile_tokens[session_id] = {
+            'token': token,
+            'user_id': user_id,
+            'account_id': account_id,
+            'expires_at': expires_at,
+        }
+
+        mobile_url = _make_mobile_qr_url(base_url, session_id, token)
+        qr_code_url = result.get('qr_code_url') or ''
+        escaped_account = html.escape(account_id)
+        escaped_mobile_url = html.escape(mobile_url, quote=True)
+        content = (
+            f"<h3>闲鱼账号 {escaped_account} 扫码登录</h3>"
+            f"<p>二维码5分钟内有效，扫码后后台会只更新这个目标账号。</p>"
+            f"<p><a href=\"{escaped_mobile_url}\">打开手机扫码页面</a></p>"
+        )
+        if qr_code_url.startswith('data:image/'):
+            content += f"<p><img src=\"{qr_code_url}\" style=\"width:220px;max-width:100%;height:auto;\" /></p>"
+        content += f"<p style=\"word-break:break-all;\">{escaped_mobile_url}</p>"
+
+        channel_results = await _send_qr_login_push_notice(
+            user_id,
+            selected_channels,
+            f"闲鱼扫码登录：{account_id}",
+            content
+        )
+
+        watch_task = asyncio.create_task(
+            _watch_pushed_qr_login_session(
+                session_id=session_id,
+                target_account_id=account_id,
+                current_user=user.copy(),
+                settings={**normalized, 'channel_ids': selected_channels},
+            )
+        )
+        qr_login_push_watch_tasks[session_id] = watch_task
+
+        pushes.append({
+            'account_id': account_id,
+            'success': any(item.get('success') for item in channel_results),
+            'session_id': session_id,
+            'mobile_url': mobile_url,
+            'channel_results': channel_results,
+        })
+
+    return {
+        'success': any(item.get('success') for item in pushes),
+        'pushes': pushes,
+    }
+
+
+async def qr_login_push_loop():
+    """每日按用户配置推送扫码登录二维码。"""
+    logger.info("每日扫码登录二维码推送任务已启动")
+    try:
+        while True:
+            try:
+                users = db_manager.get_all_users()
+                for user in users:
+                    user_id = int(user['id'])
+                    settings = _load_qr_login_push_settings(user_id)
+                    if not settings.get('enabled'):
+                        continue
+                    if not settings.get('account_ids') or not settings.get('channel_ids'):
+                        continue
+                    if not settings.get('public_base_url'):
+                        logger.warning(f"用户 {user_id} 已启用扫码推送但未配置访问基地址，跳过定时推送")
+                        continue
+
+                    try:
+                        now = datetime.now(ZoneInfo(settings.get('timezone') or 'Asia/Shanghai'))
+                    except Exception:
+                        now = datetime.now(ZoneInfo('Asia/Shanghai'))
+
+                    today_key = (user_id, now.date().isoformat())
+                    if now.strftime('%H:%M') != settings.get('schedule_time'):
+                        continue
+                    if today_key in qr_login_push_sent_dates:
+                        continue
+
+                    current_user = {
+                        'user_id': user_id,
+                        'username': user.get('username', f'user-{user_id}'),
+                        'is_admin': False,
+                    }
+                    try:
+                        await _create_and_push_qr_login_sessions(current_user, settings)
+                        qr_login_push_sent_dates.add(today_key)
+                        logger.info(f"用户 {user_id} 每日扫码登录二维码已推送")
+                    except Exception as exc:
+                        logger.error(f"用户 {user_id} 每日扫码登录二维码推送失败: {exc}")
+
+                await asyncio.sleep(30)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"每日扫码登录二维码推送循环异常: {exc}")
+                await asyncio.sleep(60)
+    except asyncio.CancelledError:
+        logger.info("每日扫码登录二维码推送任务已取消")
+        raise
+
+
 async def _process_qr_login_session(session_id: str, cookies: str, unb: str, current_user: Dict[str, Any]) -> None:
     """后台处理扫码成功后的 Cookie 刷新和账号入库，避免阻塞轮询接口"""
     try:
@@ -246,6 +661,131 @@ async def _process_qr_login_session(session_id: str, cookies: str, unb: str, cur
         log_with_user('error', f"扫码登录后台处理异常: {session_id}, {str(e)}", current_user)
     finally:
         qr_check_tasks.pop(session_id, None)
+
+
+async def _process_pushed_qr_login_cookies(
+    session_id: str,
+    cookies: str,
+    unb: str,
+    target_account_id: str,
+    current_user: Dict[str, Any],
+    settings: Dict[str, Any],
+) -> Dict[str, Any]:
+    """处理每日推送扫码结果，只允许更新指定账号。"""
+    user_id = int(current_user['user_id'])
+    user_cookies = db_manager.get_all_cookies(user_id)
+    target_cookie = user_cookies.get(target_account_id)
+    if not target_cookie:
+        raise ValueError(f"目标账号不存在或无权访问: {target_account_id}")
+
+    target_unb = _get_cookie_unb(target_cookie)
+    if target_unb and unb and str(target_unb) != str(unb):
+        message = f"扫码账号不匹配，目标账号UNB={target_unb}，扫码UNB={unb}，已拒绝更新 {target_account_id}"
+        await _notify_qr_push_result(user_id, settings, "闲鱼扫码登录被拒绝", message)
+        raise ValueError(message)
+
+    from XianyuAutoAsync import XianyuLive
+
+    temp_instance = XianyuLive(
+        cookies_str=cookies,
+        cookie_id=target_account_id,
+        user_id=user_id
+    )
+
+    refresh_success = await temp_instance.refresh_cookies_from_qr_login(
+        qr_cookies_str=cookies,
+        cookie_id=target_account_id,
+        user_id=user_id
+    )
+
+    if not refresh_success:
+        db_manager.update_cookie_account_info(target_account_id, cookie_value=cookies, user_id=user_id)
+
+    updated_cookie_info = db_manager.get_cookie_by_id(target_account_id)
+    real_cookies = (updated_cookie_info or {}).get('cookies_str') or cookies
+
+    if cookie_manager.manager:
+        update_result = cookie_manager.manager.update_cookie(target_account_id, real_cookies, save_to_db=False)
+        if asyncio.isfuture(update_result) or isinstance(update_result, asyncio.Task):
+            await update_result
+
+    message = f"账号 {target_account_id} 扫码登录刷新成功"
+    await _notify_qr_push_result(user_id, settings, "闲鱼扫码登录已更新", message)
+    log_with_user('info', f"每日推送扫码登录处理完成: session={session_id}, account={target_account_id}", current_user)
+
+    return {
+        'account_id': target_account_id,
+        'unb': unb,
+        'real_cookie_refreshed': bool(refresh_success),
+        'cookie_length': len(real_cookies),
+    }
+
+
+async def _watch_pushed_qr_login_session(
+    session_id: str,
+    target_account_id: str,
+    current_user: Dict[str, Any],
+    settings: Dict[str, Any],
+):
+    """后台等待每日推送二维码扫码完成，并更新指定账号Cookie。"""
+    try:
+        deadline = time.time() + QR_LOGIN_PUSH_SESSION_TTL
+        while time.time() < deadline:
+            status_info = qr_login_manager.get_session_status(session_id)
+            status_value = status_info.get('status')
+            if status_value == 'success':
+                cookies_info = qr_login_manager.get_session_cookies(session_id)
+                if not cookies_info:
+                    raise ValueError("扫码成功但未获取到Cookie")
+                await _process_pushed_qr_login_cookies(
+                    session_id=session_id,
+                    cookies=cookies_info['cookies'],
+                    unb=cookies_info.get('unb') or status_info.get('unb'),
+                    target_account_id=target_account_id,
+                    current_user=current_user,
+                    settings=settings,
+                )
+                return
+
+            if status_value == 'verification_required':
+                verification_url = status_info.get('verification_url', '')
+                await _notify_qr_push_result(
+                    int(current_user['user_id']),
+                    settings,
+                    "闲鱼扫码登录需要验证",
+                    f"账号 {target_account_id} 扫码后触发验证：{verification_url}"
+                )
+                return
+
+            if status_value in ('expired', 'cancelled', 'not_found'):
+                await _notify_qr_push_result(
+                    int(current_user['user_id']),
+                    settings,
+                    "闲鱼扫码登录未完成",
+                    f"账号 {target_account_id} 二维码状态：{status_value}"
+                )
+                return
+
+            await asyncio.sleep(1.5)
+
+        await _notify_qr_push_result(
+            int(current_user['user_id']),
+            settings,
+            "闲鱼扫码登录已过期",
+            f"账号 {target_account_id} 的二维码5分钟内未完成扫码"
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        await _notify_qr_push_result(
+            int(current_user['user_id']),
+            settings,
+            "闲鱼扫码登录处理失败",
+            f"账号 {target_account_id} 处理失败：{exc}"
+        )
+        logger.error(f"每日推送扫码登录处理异常: session={session_id}, account={target_account_id}, error={exc}")
+    finally:
+        qr_login_push_watch_tasks.pop(session_id, None)
 
 
 def load_keywords() -> List[Tuple[str, str]]:
@@ -525,6 +1065,64 @@ async def log_requests(request, call_next):
     logger.info(f"✅ API响应: {request.method} {request.url.path} - {response.status_code} ({process_time:.3f}s)")
 
     return response
+
+
+@app.middleware("http")
+async def refresh_session_cookie(request: Request, call_next):
+    response = await call_next(request)
+
+    session_id = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_id:
+        return response
+
+    session_info = _get_session(session_id)
+    if not session_info:
+        response.delete_cookie(key=SESSION_COOKIE_NAME, path='/')
+        return response
+
+    expires_at = _refresh_session_expiry(session_id)
+    if expires_at is None:
+        response.delete_cookie(key=SESSION_COOKIE_NAME, path='/')
+        return response
+
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=session_id,
+        httponly=True,
+        samesite='lax',
+        secure=False,
+        max_age=SESSION_EXPIRE_SECONDS,
+        expires=expires_at,
+        path='/',
+    )
+    return response
+
+
+@app.on_event("startup")
+async def start_qr_login_push_background_task():
+    global qr_login_push_task
+    if qr_login_push_task and not qr_login_push_task.done():
+        return
+    qr_login_push_task = asyncio.create_task(qr_login_push_loop())
+
+
+@app.on_event("shutdown")
+async def stop_qr_login_push_background_task():
+    global qr_login_push_task
+    tasks = []
+    if qr_login_push_task and not qr_login_push_task.done():
+        qr_login_push_task.cancel()
+        tasks.append(qr_login_push_task)
+    qr_login_push_task = None
+
+    for task in list(qr_login_push_watch_tasks.values()):
+        if task and not task.done():
+            task.cancel()
+            tasks.append(task)
+    qr_login_push_watch_tasks.clear()
+
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
 
 # 提供前端静态文件
 import os
@@ -1585,18 +2183,33 @@ class DefaultReplyIn(BaseModel):
 class NotificationChannelIn(BaseModel):
     name: str
     type: str = "qq"
-    config: str
+    config: Any
 
 
 class NotificationChannelUpdate(BaseModel):
-    name: str
-    config: str
-    enabled: bool = True
+    name: Optional[str] = None
+    type: Optional[str] = None
+    config: Optional[Any] = None
+    enabled: Optional[bool] = None
 
 
 class MessageNotificationIn(BaseModel):
     channel_id: int
     enabled: bool = True
+
+
+class QRLoginPushSettingsIn(BaseModel):
+    enabled: bool = False
+    schedule_time: str = "09:00"
+    timezone: str = "Asia/Shanghai"
+    account_ids: List[str] = Field(default_factory=list)
+    channel_ids: List[int] = Field(default_factory=list)
+    public_base_url: str = ""
+
+
+class QRLoginPushTestIn(BaseModel):
+    account_ids: Optional[List[str]] = None
+    channel_ids: Optional[List[int]] = None
 
 
 class SystemSettingIn(BaseModel):
@@ -2509,6 +3122,63 @@ async def generate_qr_code(current_user: Dict[str, Any] = Depends(get_current_us
         return {'success': False, 'message': f'生成二维码失败: {str(e)}'}
 
 
+@app.get("/qr-login/mobile/{session_id}", response_class=HTMLResponse)
+async def qr_login_mobile_page(session_id: str, token: str = Query(default='')):
+    """手机端只读扫码页面，不暴露Cookie。"""
+    token_record = qr_mobile_tokens.get(session_id)
+    now = time.time()
+    if (
+        not token_record
+        or not secrets.compare_digest(str(token_record.get('token') or ''), str(token or ''))
+        or float(token_record.get('expires_at') or 0) <= now
+    ):
+        return HTMLResponse(
+            "<!doctype html><meta charset='utf-8'><title>二维码已失效</title>"
+            "<body style='font-family:-apple-system,BlinkMacSystemFont,sans-serif;padding:24px;'>"
+            "<h2>二维码已失效</h2><p>请等待下一次推送，或在后台手动测试推送。</p></body>",
+            status_code=403
+        )
+
+    status_info = qr_login_manager.get_session_status(session_id)
+    session = qr_login_manager.sessions.get(session_id)
+    qr_code_url = session.qr_code_url if session else ''
+    status_value = status_info.get('status', 'unknown')
+    status_map = {
+        'waiting': '等待扫码',
+        'scanned': '已扫码，等待手机确认',
+        'success': '扫码成功，后台正在更新Cookie',
+        'expired': '二维码已过期',
+        'cancelled': '已取消',
+        'verification_required': '需要完成手机验证',
+        'not_found': '会话不存在',
+    }
+    account_id = token_record.get('account_id', '')
+    escaped_status = html.escape(status_map.get(status_value, status_value))
+    escaped_account = html.escape(str(account_id))
+    escaped_qr = html.escape(qr_code_url, quote=True)
+    verification_url = html.escape(status_info.get('verification_url', ''), quote=True)
+
+    body = (
+        "<!doctype html><html><head><meta charset='utf-8'>"
+        "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+        "<meta http-equiv='refresh' content='3'>"
+        "<title>闲鱼扫码登录</title>"
+        "<style>body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;margin:0;background:#f6f7f9;color:#111827;}"
+        ".wrap{max-width:420px;margin:0 auto;padding:28px 20px;text-align:center;}"
+        ".panel{background:#fff;border-radius:18px;padding:24px;box-shadow:0 10px 30px rgba(0,0,0,.06);}"
+        "img{width:260px;max-width:100%;height:auto;border:1px solid #eee;border-radius:12px;}"
+        ".status{display:inline-block;margin:14px 0;padding:8px 12px;border-radius:999px;background:#111827;color:white;font-size:14px;}"
+        "a{color:#2563eb;word-break:break-all;}</style></head><body><div class='wrap'><div class='panel'>"
+        f"<h2>账号 {escaped_account}</h2><div class='status'>{escaped_status}</div>"
+    )
+    if qr_code_url and status_value in ('waiting', 'scanned'):
+        body += f"<p><img src='{escaped_qr}' alt='扫码登录二维码'></p>"
+    if status_value == 'verification_required' and verification_url:
+        body += f"<p><a href='{verification_url}'>打开验证链接</a></p>"
+    body += "<p>二维码5分钟内有效。扫码成功后本页会自动刷新状态。</p></div></div></body></html>"
+    return HTMLResponse(body)
+
+
 @app.get("/qr-login/check/{session_id}")
 async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """检查扫码登录状态"""
@@ -3041,7 +3711,7 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
         channel_id = db_manager.create_notification_channel(
             channel_data.name,
             channel_data.type,
-            channel_data.config,
+            _serialize_channel_config(channel_data.config),
             user_id
         )
         return {'msg': 'notification channel created', 'id': channel_id}
@@ -3050,13 +3720,15 @@ def create_notification_channel(channel_data: NotificationChannelIn, current_use
 
 
 @app.get('/notification-channels/{channel_id}')
-def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
+def get_notification_channel(channel_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取指定通知渠道"""
     from db_manager import db_manager
     try:
         channel = db_manager.get_notification_channel(channel_id)
         if not channel:
             raise HTTPException(status_code=404, detail='通知渠道不存在')
+        if channel.get('user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权访问该通知渠道')
         return channel
     except HTTPException:
         raise
@@ -3065,15 +3737,26 @@ def get_notification_channel(channel_id: int, _: None = Depends(require_auth)):
 
 
 @app.put('/notification-channels/{channel_id}')
-def update_notification_channel(channel_id: int, channel_data: NotificationChannelUpdate, _: None = Depends(require_auth)):
+def update_notification_channel(
+    channel_id: int,
+    channel_data: NotificationChannelUpdate,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
     """更新通知渠道"""
     from db_manager import db_manager
     try:
+        existing = db_manager.get_notification_channel(channel_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail='通知渠道不存在')
+        if existing.get('user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权操作该通知渠道')
+
         success = db_manager.update_notification_channel(
             channel_id,
-            channel_data.name,
-            channel_data.config,
-            channel_data.enabled
+            channel_data.name if channel_data.name is not None else existing.get('name'),
+            _serialize_channel_config(channel_data.config) if channel_data.config is not None else existing.get('config'),
+            channel_data.enabled if channel_data.enabled is not None else existing.get('enabled', True),
+            channel_data.type if channel_data.type is not None else existing.get('type')
         )
         if success:
             return {'msg': 'notification channel updated'}
@@ -3086,10 +3769,16 @@ def update_notification_channel(channel_id: int, channel_data: NotificationChann
 
 
 @app.delete('/notification-channels/{channel_id}')
-def delete_notification_channel(channel_id: int, _: None = Depends(require_auth)):
+def delete_notification_channel(channel_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除通知渠道"""
     from db_manager import db_manager
     try:
+        existing = db_manager.get_notification_channel(channel_id)
+        if not existing:
+            raise HTTPException(status_code=404, detail='通知渠道不存在')
+        if existing.get('user_id') != current_user['user_id']:
+            raise HTTPException(status_code=403, detail='无权操作该通知渠道')
+
         success = db_manager.delete_notification_channel(channel_id)
         if success:
             return {'msg': 'notification channel deleted'}
@@ -5258,6 +5947,45 @@ def get_user_setting(key: str, current_user: Dict[str, Any] = Depends(get_curren
             raise HTTPException(status_code=404, detail='设置不存在')
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ------------------------- 扫码登录推送接口 -------------------------
+
+@app.get('/qr-login-push/settings')
+def get_qr_login_push_settings(current_user: Dict[str, Any] = Depends(get_current_user)):
+    user_id = int(current_user['user_id'])
+    return _load_qr_login_push_settings(user_id)
+
+
+@app.put('/qr-login-push/settings')
+def update_qr_login_push_settings(
+    settings_data: QRLoginPushSettingsIn,
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    user_id = int(current_user['user_id'])
+    normalized = _validate_qr_login_push_settings(_model_to_dict(settings_data), user_id)
+    if not _save_qr_login_push_settings(user_id, normalized):
+        raise HTTPException(status_code=500, detail="保存扫码推送配置失败")
+    return {'success': True, 'data': normalized}
+
+
+@app.post('/qr-login-push/test')
+async def test_qr_login_push(
+    request: Request,
+    test_data: Optional[QRLoginPushTestIn] = Body(default=None),
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    user_id = int(current_user['user_id'])
+    settings = _load_qr_login_push_settings(user_id)
+    test_payload = test_data or QRLoginPushTestIn()
+    result = await _create_and_push_qr_login_sessions(
+        user=current_user,
+        settings=settings,
+        request=request,
+        account_ids=test_payload.account_ids,
+        channel_ids=test_payload.channel_ids,
+    )
+    return result
 
 
 # ------------------------- 管理员专用接口 -------------------------
@@ -7479,7 +8207,11 @@ async def import_orders(
 # 然后由 React Router 在客户端处理路由
 
 # 定义不需要返回前端页面的路径前缀（API 路径）
-API_PREFIXES = ['/api/', '/static/', '/assets', '/health', '/login', '/logout', '/verify', '/change-password', '/change-admin-password']
+API_PREFIXES = [
+    '/api/', '/static/', '/assets', '/health', '/login', '/logout', '/verify',
+    '/change-password', '/change-admin-password', '/qr-login', '/qr-login-push',
+    '/notification-channels', '/message-notifications', '/user-settings'
+]
 
 @app.get('/{path:path}', response_class=HTMLResponse)
 async def catch_all_route(path: str):
