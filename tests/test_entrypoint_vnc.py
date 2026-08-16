@@ -186,6 +186,9 @@ exit 0
             home_dir.mkdir()
             log_path = temp_path / "entrypoint.log"
             auth_file = temp_path / "x11vnc.pass"
+            password_file = temp_path / "vnc-password"
+            if vnc_password:
+                password_file.write_text(vnc_password + "\n", encoding="utf-8")
 
             self._write_mkdir_stub(bin_dir)
             self._write_passthrough_wrapper(bin_dir, "rm", "/bin/rm")
@@ -209,7 +212,7 @@ exit 0
                 "DISPLAY": ":199",
                 "VNC_SCREEN": "1980x1024x24",
                 "VNC_PORT": "5900",
-                "VNC_PASSWORD": vnc_password,
+                "VNC_PASSWORD_FILE": str(password_file),
                 "VNC_AUTH_FILE": str(auth_file),
                 "VNC_LOG_DIR": str(temp_path),
                 "VNC_STARTUP_WAIT_SECONDS": "0.1",
@@ -311,7 +314,7 @@ exit 0
         self.assertNotEqual(result.completed.returncode, 0)
         self.assertEqual(
             result.completed.stderr.strip(),
-            "VNC_PASSWORD is required when ENABLE_VNC=true",
+            "VNC password file is required and must be readable when ENABLE_VNC=true",
         )
         self.assertNotIn("python Start.py", result.calls)
 

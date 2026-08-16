@@ -7,38 +7,60 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
+VNC_OVERRIDE = ROOT / "docker-compose.vnc.yml"
 BROWSER_DATA_DIR = str((ROOT / "browser_data").resolve())
+PASSWORD_FILE = str((ROOT / "data" / "vnc_password").resolve())
+
+
+def load_compose_config(*compose_files: Path) -> dict:
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": os.environ.get("HOME", str(ROOT)),
+        "VNC_HOST_PORT": "5900",
+        "VNC_PASSWORD_FILE": PASSWORD_FILE,
+        "WEB_PORT": "8080",
+    }
+    command = ["docker", "compose"]
+    for compose_file in compose_files:
+        command.extend(["-f", str(compose_file)])
+    command.extend(["config", "--format", "json"])
+    completed = subprocess.run(
+        command,
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        env=env,
+        text=True,
+    )
+    return json.loads(completed.stdout)
 
 
 class DockerVNCConfigTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        env = {
-            "PATH": os.environ["PATH"],
-            "HOME": os.environ.get("HOME", str(ROOT)),
-            "ENABLE_VNC": "false",
-            "VNC_PORT": "5900",
-            "VNC_SCREEN": "1980x1024x24",
-            "VNC_PASSWORD": "",
-            "WEB_PORT": "8080",
-        }
-        completed = subprocess.run(
-            ["docker", "compose", "config", "--format", "json"],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-            env=env,
-            text=True,
-        )
-        cls.compose_config = json.loads(completed.stdout)
-        cls.xianyu_app = cls.compose_config["services"]["xianyu-app"]
+    def test_default_compose_does_not_reserve_a_vnc_port(self):
+        config = load_compose_config(ROOT / "docker-compose.yml")
+        xianyu_app = config["services"]["xianyu-app"]
 
-    def test_xianyu_app_publishes_vnc_on_loopback(self):
-        ports = self.xianyu_app.get("ports", [])
+        self.assertFalse(
+            any(port.get("target") == 5900 for port in xianyu_app.get("ports", []))
+        )
+        self.assertFalse(
+            any(
+                volume.get("target") == "/app/browser_data"
+                for volume in xianyu_app.get("volumes", [])
+            )
+        )
+
+    def _load_vnc_app(self) -> tuple[dict, dict]:
+        self.assertTrue(VNC_OVERRIDE.is_file(), "VNC compose override must exist")
+        config = load_compose_config(ROOT / "docker-compose.yml", VNC_OVERRIDE)
+        return config, config["services"]["xianyu-app"]
+
+    def test_vnc_override_publishes_vnc_on_loopback(self):
+        _, xianyu_app = self._load_vnc_app()
         vnc_port = next(
             (
                 port
-                for port in ports
+                for port in xianyu_app.get("ports", [])
                 if port.get("target") == 5900 and port.get("protocol") == "tcp"
             ),
             None,
@@ -48,24 +70,37 @@ class DockerVNCConfigTests(unittest.TestCase):
         self.assertEqual(vnc_port.get("host_ip"), "127.0.0.1")
         self.assertEqual(vnc_port.get("published"), "5900")
 
-    def test_xianyu_app_exposes_required_vnc_environment(self):
-        environment = self.xianyu_app.get("environment", {})
-        self.assertEqual(environment.get("ENABLE_VNC"), "false")
+    def test_vnc_override_uses_a_mounted_password_secret(self):
+        _, xianyu_app = self._load_vnc_app()
+        environment = xianyu_app.get("environment", {})
+
+        self.assertEqual(environment.get("ENABLE_VNC"), "true")
         self.assertEqual(environment.get("VNC_SCREEN"), "1980x1024x24")
         self.assertEqual(environment.get("VNC_PORT"), "5900")
-        self.assertEqual(environment.get("VNC_PASSWORD"), "")
+        self.assertEqual(
+            environment.get("VNC_PASSWORD_FILE"),
+            "/run/secrets/vnc_password",
+        )
+        self.assertNotIn("VNC_PASSWORD", environment)
+        self.assertTrue(
+            any(
+                secret.get("target") == "vnc_password"
+                for secret in xianyu_app.get("secrets", [])
+            )
+        )
 
-    def test_xianyu_app_mounts_browser_data_bind_volume(self):
-        volumes = self.xianyu_app.get("volumes", [])
+    def test_vnc_override_mounts_browser_data_bind_volume(self):
+        _, xianyu_app = self._load_vnc_app()
         browser_data = next(
-            (volume for volume in volumes if volume.get("target") == "/app/browser_data"),
+            (
+                volume
+                for volume in xianyu_app.get("volumes", [])
+                if volume.get("target") == "/app/browser_data"
+            ),
             None,
         )
 
-        self.assertIsNotNone(
-            browser_data,
-            "xianyu-app must bind-mount /app/browser_data",
-        )
+        self.assertIsNotNone(browser_data)
         self.assertEqual(browser_data.get("type"), "bind")
         self.assertEqual(browser_data.get("source"), BROWSER_DATA_DIR)
 

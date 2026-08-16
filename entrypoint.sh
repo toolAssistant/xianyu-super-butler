@@ -62,13 +62,21 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
   VNC_SCREEN=${VNC_SCREEN:-1980x1024x24}
   VNC_PORT=${VNC_PORT:-5900}
   VNC_AUTH_FILE=${VNC_AUTH_FILE:-/tmp/x11vnc.pass}
+  VNC_PASSWORD_FILE=${VNC_PASSWORD_FILE:-}
   VNC_LOG_DIR=${VNC_LOG_DIR:-/tmp}
   VNC_STARTUP_WAIT_SECONDS=${VNC_STARTUP_WAIT_SECONDS:-1}
   VNC_WATCH_INTERVAL_SECONDS=${VNC_WATCH_INTERVAL_SECONDS:-1}
   export DISPLAY VNC_SCREEN VNC_PORT
 
-  if [ -z "${VNC_PASSWORD:-}" ]; then
-    printf '%s\n' 'VNC_PASSWORD is required when ENABLE_VNC=true' >&2
+  if [ -z "$VNC_PASSWORD_FILE" ] || [ ! -r "$VNC_PASSWORD_FILE" ]; then
+    printf '%s\n' 'VNC password file is required and must be readable when ENABLE_VNC=true' >&2
+    exit 1
+  fi
+
+  VNC_PASSWORD=''
+  IFS= read -r VNC_PASSWORD < "$VNC_PASSWORD_FILE" || true
+  if [ -z "$VNC_PASSWORD" ]; then
+    printf '%s\n' 'VNC password file must not be empty' >&2
     exit 1
   fi
 

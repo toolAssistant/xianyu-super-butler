@@ -10,7 +10,6 @@ services:
     user: "0:0"
     ports:
       - "${WEB_PORT:-8080}:8080"
-      - "127.0.0.1:${VNC_PORT:-5900}:5900"
     volumes:
       # 数据持久化
       - ./data:/app/data:rw
@@ -20,7 +19,6 @@ services:
       # - ./custom_config.yml:/app/global_config.yml:ro
       # 可选：备份目录
       - ./backups:/app/backups:rw
-      - ./browser_data:/app/browser_data:rw
     environment:
       - PYTHONUNBUFFERED=${PYTHONUNBUFFERED:-1}
       - PYTHONDONTWRITEBYTECODE=${PYTHONDONTWRITEBYTECODE:-1}
@@ -66,10 +64,6 @@ services:
       - CRITICAL_ALERT_COOLDOWN_SECONDS=${CRITICAL_ALERT_COOLDOWN_SECONDS:-1800}
       - CRITICAL_ALERT_MAX_ATTEMPTS=${CRITICAL_ALERT_MAX_ATTEMPTS:-3}
       - MESSAGE_EXPIRE_TIME=${MESSAGE_EXPIRE_TIME:-300000}
-      - ENABLE_VNC=${ENABLE_VNC:-false}
-      - VNC_SCREEN=${VNC_SCREEN:-1980x1024x24}
-      - VNC_PORT=5900
-      - VNC_PASSWORD=${VNC_PASSWORD:-}
 
     networks:
       - xianyu-network
