@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import unittest
 from pathlib import Path
@@ -6,16 +7,27 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DOCKERFILE = ROOT / "Dockerfile"
+BROWSER_DATA_DIR = str((ROOT / "browser_data").resolve())
 
 
 class DockerVNCConfigTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        env = {
+            "PATH": os.environ["PATH"],
+            "HOME": os.environ.get("HOME", str(ROOT)),
+            "ENABLE_VNC": "false",
+            "VNC_PORT": "5900",
+            "VNC_SCREEN": "1980x1024x24",
+            "VNC_PASSWORD": "",
+            "WEB_PORT": "8080",
+        }
         completed = subprocess.run(
             ["docker", "compose", "config", "--format", "json"],
             cwd=ROOT,
             check=True,
             capture_output=True,
+            env=env,
             text=True,
         )
         cls.compose_config = json.loads(completed.stdout)
@@ -55,14 +67,16 @@ class DockerVNCConfigTests(unittest.TestCase):
             "xianyu-app must bind-mount /app/browser_data",
         )
         self.assertEqual(browser_data.get("type"), "bind")
-        self.assertTrue(str(browser_data.get("source", "")).endswith("browser_data"))
+        self.assertEqual(browser_data.get("source"), BROWSER_DATA_DIR)
 
     def test_dockerfile_exposes_http_and_vnc_ports(self):
         expose_ports: set[str] = set()
         for line in DOCKERFILE.read_text(encoding="utf-8").splitlines():
             stripped = line.strip()
             if stripped.startswith("EXPOSE "):
-                expose_ports.update(stripped.split()[1:])
+                expose_ports.update(
+                    token.split("/", 1)[0] for token in stripped.split()[1:]
+                )
 
         self.assertIn("8080", expose_ports)
         self.assertIn("5900", expose_ports)
