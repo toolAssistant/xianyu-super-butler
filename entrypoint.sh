@@ -33,6 +33,7 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
 
   cleanup_vnc_stack() {
     cleanup_process "${python_pid:-}"
+    cleanup_process "${websockify_pid:-}"
     cleanup_process "${x11vnc_pid:-}"
     cleanup_process "${fluxbox_pid:-}"
     cleanup_process "${xvfb_pid:-}"
@@ -51,7 +52,7 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
 
   trap 'cleanup_vnc_stack' EXIT INT TERM HUP
 
-  for required_command in Xvfb fluxbox x11vnc ps; do
+  for required_command in Xvfb fluxbox x11vnc websockify ps; do
     if ! command -v "$required_command" >/dev/null 2>&1; then
       printf '%s\n' "required command not found: $required_command" >&2
       exit 1
@@ -61,12 +62,13 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
   DISPLAY=${DISPLAY:-:99}
   VNC_SCREEN=${VNC_SCREEN:-1980x1024x24}
   VNC_PORT=${VNC_PORT:-5900}
+  NOVNC_PORT=${NOVNC_PORT:-6080}
   VNC_AUTH_FILE=${VNC_AUTH_FILE:-/tmp/x11vnc.pass}
   VNC_PASSWORD_FILE=${VNC_PASSWORD_FILE:-}
   VNC_LOG_DIR=${VNC_LOG_DIR:-/tmp}
   VNC_STARTUP_WAIT_SECONDS=${VNC_STARTUP_WAIT_SECONDS:-1}
   VNC_WATCH_INTERVAL_SECONDS=${VNC_WATCH_INTERVAL_SECONDS:-1}
-  export DISPLAY VNC_SCREEN VNC_PORT
+  export DISPLAY VNC_SCREEN VNC_PORT NOVNC_PORT
 
   if [ -z "$VNC_PASSWORD_FILE" ] || [ ! -r "$VNC_PASSWORD_FILE" ]; then
     printf '%s\n' 'VNC password file is required and must be readable when ENABLE_VNC=true' >&2
@@ -81,11 +83,14 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
   fi
 
   mkdir -p "$VNC_LOG_DIR"
+  previous_umask=$(umask)
   umask 077
   if ! x11vnc -storepasswd "$VNC_PASSWORD" "$VNC_AUTH_FILE" >/dev/null 2>&1; then
+    umask "$previous_umask"
     printf '%s\n' "failed to create VNC password file: $VNC_AUTH_FILE" >&2
     exit 1
   fi
+  umask "$previous_umask"
   unset VNC_PASSWORD
 
   display_number=${DISPLAY#:}
@@ -96,6 +101,7 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
   xvfb_log="$VNC_LOG_DIR/xvfb.log"
   fluxbox_log="$VNC_LOG_DIR/fluxbox.log"
   x11vnc_log="$VNC_LOG_DIR/x11vnc.log"
+  websockify_log="$VNC_LOG_DIR/websockify.log"
 
   Xvfb "$DISPLAY" -screen 0 "$VNC_SCREEN" -ac +extension RANDR </dev/null >"$xvfb_log" 2>&1 &
   xvfb_pid=$!
@@ -122,16 +128,26 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
     exit 1
   fi
 
+  websockify --web=/usr/share/novnc "$NOVNC_PORT" "127.0.0.1:$VNC_PORT" \
+    </dev/null >"$websockify_log" 2>&1 &
+  websockify_pid=$!
+  sleep "$VNC_STARTUP_WAIT_SECONDS"
+  if ! process_is_running "$websockify_pid"; then
+    report_service_failure websockify "$websockify_log"
+    exit 1
+  fi
+
   /bin/sh -c 'exec python Start.py' &
   python_pid=$!
 
   python_status=0
   while process_is_running "$python_pid"; do
-    for service_name in Xvfb fluxbox x11vnc; do
+    for service_name in Xvfb fluxbox x11vnc websockify; do
       case "$service_name" in
         Xvfb) service_pid=$xvfb_pid ;;
         fluxbox) service_pid=$fluxbox_pid ;;
         x11vnc) service_pid=$x11vnc_pid ;;
+        websockify) service_pid=$websockify_pid ;;
       esac
       if ! process_is_running "$service_pid"; then
         printf '%s\n' "$service_name exited unexpectedly" >&2

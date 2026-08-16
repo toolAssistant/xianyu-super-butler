@@ -9,6 +9,17 @@ from pathlib import Path
 
 
 ENTRYPOINT = Path(__file__).resolve().parents[1] / "entrypoint.sh"
+VNC_COMMANDS = [
+    "mkdir",
+    "python",
+    "rm",
+    "sleep",
+    "ps",
+    "Xvfb",
+    "fluxbox",
+    "x11vnc",
+    "websockify",
+]
 
 
 @dataclass
@@ -19,6 +30,7 @@ class EntrypointRunResult:
     live_pids: list[int]
     remaining_pid_files: list[str]
     cleanup_survivor_pids: list[int]
+    app_umask: str
 
 
 class EntrypointVNCTests(unittest.TestCase):
@@ -94,7 +106,7 @@ done
 set -eu
 if [ "${ENABLE_VNC}" = "true" ]; then
   pids=""
-  for service in Xvfb fluxbox x11vnc; do
+  for service in Xvfb fluxbox x11vnc websockify; do
     pid_file="$PID_DIR/$service.pid"
     if [ ! -s "$pid_file" ]; then
       printf "%s\\n" "required service not running: $service" >&2
@@ -108,6 +120,7 @@ if [ "${ENABLE_VNC}" = "true" ]; then
     pids="$pids $pid"
   done
 fi
+umask > "$UMASK_LOG"
 if [ "$#" -eq 0 ]; then
   printf "%s\\n" "python" >> "$CALL_LOG"
 else
@@ -185,6 +198,7 @@ exit 0
             pid_dir.mkdir()
             home_dir.mkdir()
             log_path = temp_path / "entrypoint.log"
+            umask_path = temp_path / "app.umask"
             auth_file = temp_path / "x11vnc.pass"
             password_file = temp_path / "vnc-password"
             if vnc_password:
@@ -219,6 +233,7 @@ exit 0
                 "VNC_WATCH_INTERVAL_SECONDS": "0.1",
                 "PYTHON_STUB_SLEEP": python_sleep,
                 "CALL_LOG": str(log_path),
+                "UMASK_LOG": str(umask_path),
                 "PID_DIR": str(pid_dir),
             }
 
@@ -230,6 +245,7 @@ exit 0
                     capture_output=True,
                     text=True,
                     timeout=timeout_seconds,
+                    preexec_fn=lambda: os.umask(0o022),
                 )
             except subprocess.TimeoutExpired as exc:
                 completed = subprocess.CompletedProcess(
@@ -250,6 +266,11 @@ exit 0
             live_pids = self._wait_for_natural_exit(launched_pids)
             remaining_pid_files = sorted(path.name for path in pid_dir.glob("*.pid"))
             cleanup_survivor_pids = self._force_cleanup(pid_dir)
+            app_umask = (
+                umask_path.read_text(encoding="utf-8").strip()
+                if umask_path.exists()
+                else ""
+            )
 
             return EntrypointRunResult(
                 completed=completed,
@@ -258,6 +279,7 @@ exit 0
                 live_pids=live_pids,
                 remaining_pid_files=remaining_pid_files,
                 cleanup_survivor_pids=cleanup_survivor_pids,
+                app_umask=app_umask,
             )
 
     def test_disable_vnc_executes_only_python_application(self):
@@ -273,7 +295,7 @@ exit 0
     def test_enable_vnc_starts_display_stack_before_python(self):
         result = self._run_entrypoint(
             enable_vnc="true",
-            available_commands=["mkdir", "python", "rm", "sleep", "ps", "Xvfb", "fluxbox", "x11vnc"],
+            available_commands=VNC_COMMANDS,
         )
 
         self._assert_no_residual_processes(result)
@@ -289,13 +311,17 @@ exit 0
                 "Xvfb :199 -screen 0 1980x1024x24 -ac +extension RANDR",
                 "fluxbox",
                 "x11vnc -display :199 -forever -shared -rfbauth [AUTH_FILE] -rfbport 5900 -listen 0.0.0.0",
+                "websockify --web=/usr/share/novnc 6080 127.0.0.1:5900",
             ],
         )
+        self.assertEqual(result.app_umask, "0022")
 
     def test_enable_vnc_requires_x11vnc_and_skips_python_when_missing(self):
         result = self._run_entrypoint(
             enable_vnc="true",
-            available_commands=["mkdir", "python", "rm", "sleep", "ps", "Xvfb", "fluxbox"],
+            available_commands=[
+                command for command in VNC_COMMANDS if command != "x11vnc"
+            ],
         )
 
         self._assert_no_residual_processes(result)
@@ -306,7 +332,7 @@ exit 0
     def test_enable_vnc_requires_a_password_before_starting_services(self):
         result = self._run_entrypoint(
             enable_vnc="true",
-            available_commands=["mkdir", "python", "rm", "sleep", "ps", "Xvfb", "fluxbox", "x11vnc"],
+            available_commands=VNC_COMMANDS,
             vnc_password="",
         )
 
@@ -321,7 +347,7 @@ exit 0
     def test_enable_vnc_rejects_a_service_that_exits_during_startup(self):
         result = self._run_entrypoint(
             enable_vnc="true",
-            available_commands=["mkdir", "python", "rm", "sleep", "ps", "Xvfb", "fluxbox", "x11vnc"],
+            available_commands=VNC_COMMANDS,
             service_modes={"x11vnc": "exit"},
         )
 
@@ -333,7 +359,7 @@ exit 0
     def test_enable_vnc_stops_the_app_if_a_display_service_dies(self):
         result = self._run_entrypoint(
             enable_vnc="true",
-            available_commands=["mkdir", "python", "rm", "sleep", "ps", "Xvfb", "fluxbox", "x11vnc"],
+            available_commands=VNC_COMMANDS,
             service_modes={"x11vnc": "delayed_exit"},
             python_sleep="4",
         )

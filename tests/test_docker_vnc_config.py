@@ -41,7 +41,10 @@ class DockerVNCConfigTests(unittest.TestCase):
         xianyu_app = config["services"]["xianyu-app"]
 
         self.assertFalse(
-            any(port.get("target") == 5900 for port in xianyu_app.get("ports", []))
+            any(
+                port.get("target") in {5900, 6080}
+                for port in xianyu_app.get("ports", [])
+            )
         )
         self.assertFalse(
             any(
@@ -70,6 +73,21 @@ class DockerVNCConfigTests(unittest.TestCase):
         self.assertEqual(vnc_port.get("host_ip"), "127.0.0.1")
         self.assertEqual(vnc_port.get("published"), "5900")
 
+    def test_vnc_override_publishes_novnc_on_loopback(self):
+        _, xianyu_app = self._load_vnc_app()
+        novnc_port = next(
+            (
+                port
+                for port in xianyu_app.get("ports", [])
+                if port.get("target") == 6080 and port.get("protocol") == "tcp"
+            ),
+            None,
+        )
+
+        self.assertIsNotNone(novnc_port, "xianyu-app must publish 6080/tcp")
+        self.assertEqual(novnc_port.get("host_ip"), "127.0.0.1")
+        self.assertEqual(novnc_port.get("published"), "6080")
+
     def test_vnc_override_uses_a_mounted_password_secret(self):
         _, xianyu_app = self._load_vnc_app()
         environment = xianyu_app.get("environment", {})
@@ -77,6 +95,7 @@ class DockerVNCConfigTests(unittest.TestCase):
         self.assertEqual(environment.get("ENABLE_VNC"), "true")
         self.assertEqual(environment.get("VNC_SCREEN"), "1980x1024x24")
         self.assertEqual(environment.get("VNC_PORT"), "5900")
+        self.assertEqual(environment.get("NOVNC_PORT"), "6080")
         self.assertEqual(
             environment.get("VNC_PASSWORD_FILE"),
             "/run/secrets/vnc_password",
@@ -115,6 +134,7 @@ class DockerVNCConfigTests(unittest.TestCase):
 
         self.assertIn("8080", expose_ports)
         self.assertIn("5900", expose_ports)
+        self.assertIn("6080", expose_ports)
 
 
 if __name__ == "__main__":
