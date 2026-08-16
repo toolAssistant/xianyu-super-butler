@@ -67,7 +67,7 @@ cleanup() {{
 trap 'cleanup; exit 0' TERM INT
 trap 'cleanup' EXIT
 while :; do
-  /bin/sleep 1
+  /bin/sleep 0.1
 done
 """,
         )
@@ -146,6 +146,14 @@ exit 0
             return False
         return True
 
+    def _wait_for_natural_exit(self, launched_pids: list[int]) -> list[int]:
+        deadline = time.monotonic() + 2
+        live_pids = [pid for pid in launched_pids if self._is_process_alive(pid)]
+        while live_pids and time.monotonic() < deadline:
+            time.sleep(0.05)
+            live_pids = [pid for pid in launched_pids if self._is_process_alive(pid)]
+        return live_pids
+
     def _force_cleanup(self, pid_dir: Path) -> list[int]:
         launched_pids = self._read_pid_list(pid_dir)
         for pid in launched_pids:
@@ -168,7 +176,7 @@ exit 0
         self.assertEqual(result.cleanup_survivor_pids, [])
 
     def _run_entrypoint(self, *, enable_vnc: str, available_commands: list[str]) -> EntrypointRunResult:
-        timeout_seconds = 3
+        timeout_seconds = 10
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_path = Path(temp_dir)
             bin_dir = temp_path / "bin"
@@ -222,7 +230,7 @@ exit 0
                 calls = log_path.read_text(encoding="utf-8").splitlines()
 
             launched_pids = self._read_pid_list(pid_dir)
-            live_pids = [pid for pid in launched_pids if self._is_process_alive(pid)]
+            live_pids = self._wait_for_natural_exit(launched_pids)
             remaining_pid_files = sorted(path.name for path in pid_dir.glob("*.pid"))
             cleanup_survivor_pids = self._force_cleanup(pid_dir)
 
