@@ -9,8 +9,8 @@ written back to the account record and used by the message WebSocket.
 
 ## Scope
 
-- Add an optional virtual display and VNC server to the existing application
-  container.
+- Add an optional virtual display, VNC server, and noVNC browser client to the
+  existing application container.
 - Run password-login recovery in headed mode when the account's `show_browser`
   flag is enabled.
 - Publish VNC only on the host loopback interface.
@@ -23,7 +23,8 @@ written back to the account record and used by the message WebSocket.
 
 The base Compose file does not publish VNC. The opt-in
 `docker-compose.vnc.yml` override mounts a password through a Compose secret,
-binds host loopback to container port 5900, and sets `ENABLE_VNC=true`.
+binds host loopback to container ports 5900 and 6080, and sets
+`ENABLE_VNC=true`.
 The container entrypoint then starts Xvfb on `DISPLAY=:99`,
 starts Fluxbox, and exposes that display through x11vnc on container port 5900.
 The application is launched with the same `DISPLAY` value.
@@ -31,14 +32,15 @@ The application is launched with the same `DISPLAY` value.
 The target account is configured with `show_browser=true`. Existing browser
 launch code therefore creates a headed persistent Chromium context at
 `browser_data/user_<account-id>`. The operator connects to
-`vnc://127.0.0.1:5900` and acts directly on that context. After verification,
+`http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale` and acts directly
+on that context. Raw VNC remains available for compatible clients. After verification,
 the existing Playwright recovery loop reads cookies from the context, persists
 them through the existing database path, and reconnects the account instance.
 
 ## Security
 
-- The host mapping is `127.0.0.1:<port>:5900`; it is not reachable from other
-  hosts unless the operator deliberately adds a tunnel.
+- The host mappings for ports 5900 and 6080 use `127.0.0.1`; they are not
+  reachable from other hosts unless the operator deliberately adds a tunnel.
 - x11vnc uses a generated authentication file derived from the mounted Compose
   secret. The password is not stored in container environment metadata.
 - Account passwords and browser cookies are not logged or copied to the host.
@@ -59,7 +61,8 @@ them through the existing database path, and reconnects the account instance.
 - Shell-level startup test checks enabled and disabled entrypoint branches.
 - Base `docker compose config` confirms no VNC port is reserved; the config with
   `docker-compose.vnc.yml` confirms loopback-only publication and secret mount.
-- A rebuilt container must show Xvfb, Fluxbox, x11vnc, and headed Chromium.
-- A local VNC connection must display the active Xianyu verification page.
+- A rebuilt container must show Xvfb, Fluxbox, x11vnc, websockify, and headed
+  Chromium.
+- The local noVNC page must display the active Xianyu verification page.
 - Completion requires `Token` refresh success and account state transition to
   `connected`; application health alone is insufficient.

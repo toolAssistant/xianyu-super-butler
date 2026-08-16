@@ -4,9 +4,9 @@
 
 **Goal:** Expose the headed Chromium session used by Docker Playwright through a localhost-only VNC connection so Xianyu verification cookies remain in the recovery context.
 
-**Architecture:** The application entrypoint conditionally starts and supervises Xvfb, Fluxbox, and password-protected x11vnc before launching Python. An opt-in Compose override publishes VNC only on host loopback, mounts the password as a file-backed secret, and persists Playwright profile data; the existing per-account `show_browser` flag selects headed Chromium.
+**Architecture:** The application entrypoint conditionally starts and supervises Xvfb, Fluxbox, password-protected x11vnc, and noVNC/websockify before launching Python. An opt-in Compose override publishes both clients only on host loopback, mounts the password as a file-backed secret, and persists Playwright profile data; the existing per-account `show_browser` flag selects headed Chromium.
 
-> **Security review amendment:** The implemented design uses `docker-compose.vnc.yml`, `VNC_HOST_PORT`, and `VNC_PASSWORD_FILE`. These replace the original always-published port and plaintext `VNC_PASSWORD` environment proposal below.
+> **Security review amendment:** The implemented design uses `docker-compose.vnc.yml`, `VNC_HOST_PORT`, `NOVNC_HOST_PORT`, and `VNC_PASSWORD_FILE`. These replace the original always-published port and plaintext `VNC_PASSWORD` environment proposal below. noVNC is the primary client because macOS Screen Sharing rejects the loopback target as self-control.
 
 **Tech Stack:** POSIX shell, Docker Compose, Xvfb, Fluxbox, x11vnc, Python `unittest`, Playwright Chromium
 
@@ -153,6 +153,7 @@ port and browser profile volume to `docker-compose.vnc.yml`:
 ports:
   - "${WEB_PORT:-8080}:8080"
   - "127.0.0.1:${VNC_HOST_PORT:-5900}:5900"
+  - "127.0.0.1:${NOVNC_HOST_PORT:-6080}:6080"
 volumes:
   - ./browser_data:/app/browser_data:rw
 ```
@@ -165,6 +166,7 @@ Add these entries to the VNC override:
 - ENABLE_VNC=true
 - VNC_SCREEN=${VNC_SCREEN:-1980x1024x24}
 - VNC_PORT=5900
+- NOVNC_PORT=6080
 - VNC_PASSWORD_FILE=/run/secrets/vnc_password
 ```
 
@@ -174,7 +176,7 @@ port. The password is mounted as a Compose secret from
 
 - [ ] **Step 3: Document the optional container port**
 
-Change the Dockerfile declaration to `EXPOSE 8080 5900`.
+Change the Dockerfile declaration to `EXPOSE 8080 5900 6080`.
 
 - [ ] **Step 4: Validate Compose expansion**
 
@@ -230,8 +232,9 @@ Run:
 
 ```bash
 docker exec xianyu-auto-reply sh -lc \
-  'ps aux | grep -E "Xvfb|fluxbox|x11vnc|chromium" | grep -v grep'
+  'ps aux | grep -E "Xvfb|fluxbox|x11vnc|websockify|chromium" | grep -v grep'
 nc -z 127.0.0.1 5900
+nc -z 127.0.0.1 6080
 ```
 
 Expected: all four processes are present, Chromium lacks `--headless`, and the
@@ -239,9 +242,9 @@ local VNC port accepts connections.
 
 - [ ] **Step 6: Open the Docker browser for the operator**
 
-Run: `open 'vnc://127.0.0.1:5900'`
+Run: `open 'http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale'`
 
-Expected: macOS Screen Sharing displays the active Xianyu browser page.
+Expected: noVNC displays the active Xianyu browser page.
 
 ### Task 5: Verify Recovery and Publish
 
