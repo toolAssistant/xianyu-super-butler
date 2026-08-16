@@ -31,6 +31,11 @@ class SessionCheckRequest(BaseModel):
     session_id: str
 
 
+def should_process_verification_result(event_type: str) -> bool:
+    """Only the completed pointer gesture needs a screenshot and result check."""
+    return event_type == 'up'
+
+
 # =============================================================================
 # WebSocket 端点 - 实时通信
 # =============================================================================
@@ -79,50 +84,41 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                 event_type = data.get('event_type')
                 x = data.get('x')
                 y = data.get('y')
+
+                if event_type in ('down', 'up'):
+                    logger.info(f"远程滑块鼠标事件: session={session_id}, type={event_type}, x={x}, y={y}")
                 
                 success = await captcha_controller.handle_mouse_event(
                     session_id, event_type, x, y
                 )
                 
-                if success:
-                    # 只在鼠标释放后才检查完成状态
-                    if event_type == 'up':
-                        # 等待页面更新（给验证码一些反应时间）
-                        await asyncio.sleep(1.0)
-                        
-                        # 多次确认滑块确实消失
-                        completed = await captcha_controller.check_completion(session_id)
-                        
-                        if completed:
-                            # 再次确认（避免误判）
-                            await asyncio.sleep(0.5)
-                            completed = await captcha_controller.check_completion(session_id)
-                        
-                        if completed:
-                            await websocket.send_json({
-                                'type': 'completed',
-                                'message': '验证成功！'
-                            })
-                            logger.success(f"✅ 验证完成: {session_id}")
-                            break
-                        else:
-                            # 更新截图显示验证结果
-                            screenshot = await captcha_controller.update_screenshot(session_id)
-                            if screenshot:
-                                await websocket.send_json({
-                                    'type': 'screenshot_update',
-                                    'screenshot': screenshot
-                                })
-                    else:
-                        # 按下或移动时，实时更新截图（截取整个验证码容器）
-                        if event_type in ['down', 'move']:
-                            # 截取整个验证码容器，降低质量换取速度
-                            screenshot = await captcha_controller.update_screenshot(session_id, quality=30)
-                            if screenshot:
-                                await websocket.send_json({
-                                    'type': 'screenshot_update',
-                                    'screenshot': screenshot
-                                })
+                if not success or not should_process_verification_result(event_type):
+                    continue
+
+                # 截图是拖动链路中最昂贵的操作，只在松手后执行，避免移动事件积压。
+                await asyncio.sleep(1.0)
+
+                completed = await captcha_controller.check_completion(session_id)
+
+                if completed:
+                    # 再次确认（避免误判）
+                    await asyncio.sleep(0.5)
+                    completed = await captcha_controller.check_completion(session_id)
+
+                if completed:
+                    await websocket.send_json({
+                        'type': 'completed',
+                        'message': '验证成功！'
+                    })
+                    logger.success(f"✅ 验证完成: {session_id}")
+                    break
+
+                screenshot = await captcha_controller.update_screenshot(session_id)
+                if screenshot:
+                    await websocket.send_json({
+                        'type': 'screenshot_update',
+                        'screenshot': screenshot
+                    })
             
             elif msg_type == 'check_completion':
                 # 手动检查完成状态
@@ -315,4 +311,3 @@ async def captcha_control_page_with_session(session_id: str):
             return HTMLResponse(content=html_content)
     else:
         raise HTTPException(status_code=404, detail="前端页面不存在")
-

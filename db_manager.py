@@ -532,6 +532,17 @@ class DBManager:
             )
             ''')
 
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS critical_alert_state (
+                cookie_id TEXT NOT NULL,
+                alert_key TEXT NOT NULL,
+                last_sent_at REAL NOT NULL,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (cookie_id, alert_key),
+                FOREIGN KEY (cookie_id) REFERENCES cookies(id) ON DELETE CASCADE
+            )
+            ''')
+
             # 检查并添加 is_admin 列
             try:
                 self._execute_sql(cursor, "SELECT is_admin FROM users LIMIT 1")
@@ -2125,6 +2136,74 @@ class DBManager:
                 return False
 
     # -------------------- 通知渠道操作 --------------------
+    def get_enabled_pushplus_channels_for_cookie(self, cookie_id: str) -> List[Dict[str, Any]]:
+        """获取账号所有者启用的 PushPlus 渠道，不依赖普通消息通知绑定。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT nc.id, nc.name, nc.user_id, nc.type, nc.config
+                FROM cookies c
+                JOIN notification_channels nc ON nc.user_id = c.user_id
+                WHERE c.id = ? AND nc.enabled = 1 AND LOWER(nc.type) = 'pushplus'
+                ORDER BY nc.id
+                ''', (cookie_id,))
+                return [
+                    {
+                        'id': row[0],
+                        'name': row[1],
+                        'user_id': row[2],
+                        'type': row[3],
+                        'config': row[4],
+                    }
+                    for row in cursor.fetchall()
+                ]
+            except Exception as e:
+                logger.error(f"获取账号关键告警 PushPlus 渠道失败: {e}")
+                return []
+
+    def get_critical_alert_state(self, cookie_id: str, alert_key: str) -> Optional[Dict[str, Any]]:
+        """读取关键告警最近一次成功发送时间。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                SELECT cookie_id, alert_key, last_sent_at, updated_at
+                FROM critical_alert_state
+                WHERE cookie_id = ? AND alert_key = ?
+                ''', (cookie_id, alert_key))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                return {
+                    'cookie_id': row[0],
+                    'alert_key': row[1],
+                    'last_sent_at': row[2],
+                    'updated_at': row[3],
+                }
+            except Exception as e:
+                logger.error(f"读取关键告警状态失败: {e}")
+                return None
+
+    def mark_critical_alert_sent(self, cookie_id: str, alert_key: str, sent_at: float) -> bool:
+        """记录关键告警已成功发送，供跨重启冷却去重。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                INSERT INTO critical_alert_state (cookie_id, alert_key, last_sent_at, updated_at)
+                VALUES (?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(cookie_id, alert_key) DO UPDATE SET
+                    last_sent_at = excluded.last_sent_at,
+                    updated_at = CURRENT_TIMESTAMP
+                ''', (cookie_id, alert_key, float(sent_at)))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存关键告警状态失败: {e}")
+                self.conn.rollback()
+                return False
+
     def create_notification_channel(self, name: str, channel_type: str, config: str, user_id: int = None) -> int:
         """创建通知渠道"""
         with self.lock:
@@ -2397,7 +2476,8 @@ class DBManager:
 
                         # 备份其他相关表
                         related_tables = ['cookie_status', 'default_replies', 'message_notifications',
-                                        'item_info', 'ai_reply_settings', 'ai_conversations']
+                                        'item_info', 'ai_reply_settings', 'ai_conversations',
+                                        'critical_alert_state']
 
                         for table in related_tables:
                             cursor.execute(f"SELECT * FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2413,7 +2493,8 @@ class DBManager:
                         'cookies', 'keywords', 'cookie_status', 'cards',
                         'delivery_rules', 'default_replies', 'notification_channels',
                         'message_notifications', 'system_settings', 'item_info',
-                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache'
+                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                        'critical_alert_state'
                     ]
 
                     for table in tables:
@@ -2456,7 +2537,8 @@ class DBManager:
 
                         # 删除用户相关数据
                         related_tables = ['message_notifications', 'default_replies', 'item_info',
-                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings']
+                                        'cookie_status', 'keywords', 'ai_conversations', 'ai_reply_settings',
+                                        'critical_alert_state']
 
                         for table in related_tables:
                             cursor.execute(f"DELETE FROM {table} WHERE cookie_id IN ({placeholders})", user_cookie_ids)
@@ -2468,7 +2550,8 @@ class DBManager:
                     tables = [
                         'message_notifications', 'notification_channels', 'default_replies',
                         'delivery_rules', 'cards', 'item_info', 'cookie_status', 'keywords',
-                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache', 'cookies'
+                        'ai_conversations', 'ai_reply_settings', 'ai_item_cache',
+                        'critical_alert_state', 'cookies'
                     ]
 
                     for table in tables:
@@ -2483,7 +2566,8 @@ class DBManager:
                     if table_name not in ['cookies', 'keywords', 'cookie_status', 'cards',
                                         'delivery_rules', 'default_replies', 'notification_channels',
                                         'message_notifications', 'system_settings', 'item_info',
-                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache']:
+                                        'ai_reply_settings', 'ai_conversations', 'ai_item_cache',
+                                        'critical_alert_state']:
                         continue
 
                     columns = table_data['columns']
@@ -4610,22 +4694,29 @@ class DBManager:
                 # 4. 删除用户的通知渠道
                 cursor.execute('DELETE FROM notification_channels WHERE user_id = ?', (user_id,))
 
-                # 5. 删除用户的Cookie
+                # 5. 删除用户的关键告警冷却状态
+                cursor.execute(
+                    'DELETE FROM critical_alert_state WHERE cookie_id IN '
+                    '(SELECT id FROM cookies WHERE user_id = ?)',
+                    (user_id,)
+                )
+
+                # 6. 删除用户的Cookie
                 cursor.execute('DELETE FROM cookies WHERE user_id = ?', (user_id,))
 
-                # 6. 删除用户的关键字
+                # 7. 删除用户的关键字
                 cursor.execute('DELETE FROM keywords WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 7. 删除用户的默认回复
+                # 8. 删除用户的默认回复
                 cursor.execute('DELETE FROM default_replies WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 8. 删除用户的AI回复设置
+                # 9. 删除用户的AI回复设置
                 cursor.execute('DELETE FROM ai_reply_settings WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 9. 删除用户的消息通知
+                # 10. 删除用户的消息通知
                 cursor.execute('DELETE FROM message_notifications WHERE cookie_id IN (SELECT id FROM cookies WHERE user_id = ?)', (user_id,))
 
-                # 10. 最后删除用户本身
+                # 11. 最后删除用户本身
                 cursor.execute('DELETE FROM users WHERE id = ?', (user_id,))
 
                 # 提交事务

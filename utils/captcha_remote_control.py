@@ -150,6 +150,24 @@ class CaptchaRemoteController:
                             logger.debug(f"iframe检查选择器 {selector} 失败: {e}")
                             continue
             
+            page_text = await page.evaluate("() => document.body?.innerText || ''")
+            normalized_text = str(page_text or '').lower()
+            if any(keyword in normalized_text for keyword in ('drag', 'slider', '滑块', '验证')):
+                viewport = page.viewport_size or {'width': 1920, 'height': 1080}
+                width = min(420, int(viewport.get('width') or 1920))
+                height = min(180, int(viewport.get('height') or 1080))
+                x = max(0, (int(viewport.get('width') or 1920) - width) // 2)
+                y = min(640, max(0, int(viewport.get('height') or 1080) - height))
+                logger.warning("⚠️ 未找到验证码容器，使用阿里滑块固定区域")
+                return {
+                    'selector': 'fallback-alibaba-slider',
+                    'x': x,
+                    'y': y,
+                    'width': width,
+                    'height': height,
+                    'in_iframe': False
+                }
+
             logger.warning("⚠️ 未找到验证码容器")
             return None
             
@@ -365,4 +383,3 @@ class CaptchaRemoteController:
 
 # 全局实例
 captcha_controller = CaptchaRemoteController()
-

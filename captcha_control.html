@@ -107,6 +107,8 @@
             max-width: 100%;
             display: block;
             cursor: crosshair;
+            touch-action: none;
+            user-select: none;
         }
 
         .loading {
@@ -266,7 +268,7 @@
             <ol>
                 <li>输入会话ID并点击"连接"按钮</li>
                 <li>等待页面截图加载</li>
-                <li>使用鼠标在滑块按钮上按下并拖动</li>
+                <li>使用鼠标或手指在滑块按钮上按下并拖动</li>
                 <li>释放鼠标完成验证</li>
             </ol>
         </div>
@@ -308,6 +310,10 @@
         let lastMoveTime = 0;
         let moveThrottle = 5; // 节流：每10ms最多发送一次（极致流畅）
         let captchaOffset = {x: 0, y: 0}; // 滑块区域在页面中的偏移量
+        let reconnectTimer = null;
+        let reconnectAttempts = 0;
+        let maxReconnectAttempts = 40;
+        let verificationCompleted = false;
 
         // 初始化
         document.addEventListener('DOMContentLoaded', () => {
@@ -340,11 +346,11 @@
                 connectSession();
             }
 
-            // 鼠标事件
-            canvas.addEventListener('mousedown', handleMouseDown);
-            canvas.addEventListener('mousemove', handleMouseMove);
-            canvas.addEventListener('mouseup', handleMouseUp);
-            canvas.addEventListener('mouseleave', handleMouseUp);
+            // 指针事件同时支持鼠标、触控板和手机触摸。
+            canvas.addEventListener('pointerdown', handlePointerDown);
+            canvas.addEventListener('pointermove', handlePointerMove);
+            canvas.addEventListener('pointerup', handlePointerUp);
+            canvas.addEventListener('pointercancel', handlePointerUp);
         });
 
         function log(message, type = 'info') {
@@ -367,7 +373,24 @@
             document.getElementById('connectionStatus').textContent = text;
         }
 
-        async function connectSession() {
+        function scheduleReconnect() {
+            if (verificationCompleted || !currentSessionId) {
+                return;
+            }
+            if (reconnectAttempts >= maxReconnectAttempts) {
+                log('自动重连次数已达上限，请刷新页面重试', 'error');
+                document.getElementById('connectBtn').disabled = false;
+                return;
+            }
+
+            reconnectAttempts += 1;
+            const delay = Math.min(1000 + reconnectAttempts * 500, 5000);
+            log(`${Math.round(delay / 1000)}秒后自动重连 (${reconnectAttempts}/${maxReconnectAttempts})`, 'info');
+            clearTimeout(reconnectTimer);
+            reconnectTimer = setTimeout(() => connectSession(true), delay);
+        }
+
+        async function connectSession(isReconnect = false) {
             const sessionId = document.getElementById('sessionIdInput').value.trim();
             
             if (!sessionId) {
@@ -375,15 +398,28 @@
                 return;
             }
 
+            if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+                log('WebSocket 已在连接中', 'info');
+                return;
+            }
+
+            clearTimeout(reconnectTimer);
+
             currentSessionId = sessionId;
             document.getElementById('sessionIdDisplay').textContent = sessionId;
             document.getElementById('connectBtn').disabled = true;
 
-            log(`正在连接会话: ${sessionId}`, 'info');
+            if (!isReconnect) {
+                reconnectAttempts = 0;
+                verificationCompleted = false;
+            }
+
+            log(`${isReconnect ? '正在重连' : '正在连接'}会话: ${sessionId}`, 'info');
 
             try {
                 // 建立 WebSocket 连接
-                const wsUrl = `ws://${window.location.host}/api/captcha/ws/${sessionId}`;
+                const wsProtocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
+                const wsUrl = `${wsProtocol}://${window.location.host}/api/captcha/ws/${sessionId}`;
                 log(`WebSocket URL: ${wsUrl}`, 'info');
                 
                 ws = new WebSocket(wsUrl);
@@ -391,6 +427,7 @@
                 ws.onopen = () => {
                     log('WebSocket 连接成功', 'success');
                     updateStatus('connected', '已连接');
+                    reconnectAttempts = 0;
                 };
 
                 ws.onmessage = async (event) => {
@@ -401,19 +438,20 @@
                 ws.onerror = (error) => {
                     log(`WebSocket 错误: ${error}`, 'error');
                     updateStatus('disconnected', '连接错误');
-                    document.getElementById('connectBtn').disabled = false;
                 };
 
                 ws.onclose = () => {
                     log('WebSocket 连接关闭', 'info');
                     updateStatus('disconnected', '连接已关闭');
                     document.getElementById('connectBtn').disabled = false;
+                    scheduleReconnect();
                 };
 
             } catch (error) {
                 log(`连接失败: ${error}`, 'error');
                 updateStatus('disconnected', '连接失败');
                 document.getElementById('connectBtn').disabled = false;
+                scheduleReconnect();
             }
         }
 
@@ -449,6 +487,8 @@
                 log('✅ 验证成功！', 'success');
                 updateStatus('completed', '验证成功');
                 document.getElementById('verificationStatus').textContent = '已完成';
+                verificationCompleted = true;
+                clearTimeout(reconnectTimer);
                 
                 // 显示成功提示
                 setTimeout(() => {
@@ -461,6 +501,7 @@
 
             else if (type === 'error') {
                 log(`错误: ${data.message}`, 'error');
+                scheduleReconnect();
             }
         }
 
@@ -488,29 +529,39 @@
             img.src = `data:image/jpeg;base64,${base64Image}`;
         }
 
-        function handleMouseDown(event) {
-            if (!ws || ws.readyState !== WebSocket.OPEN) {
-                return;
-            }
-
-            isMouseDown = true;
-            const coords = getMouseCoords(event);
-            
-            log(`鼠标按下: (${coords.x}, ${coords.y})`, 'info');
-            
+        function sendMouseEvent(eventType, coords) {
             ws.send(JSON.stringify({
                 type: 'mouse_event',
-                event_type: 'down',
+                event_type: eventType,
                 x: coords.x,
                 y: coords.y
             }));
         }
 
-        function handleMouseMove(event) {
+        function handlePointerDown(event) {
+            if (!ws || ws.readyState !== WebSocket.OPEN) {
+                log('连接未就绪，正在尝试重连', 'error');
+                scheduleReconnect();
+                return;
+            }
+
+            event.preventDefault();
+            isMouseDown = true;
+            try {
+                canvas.setPointerCapture(event.pointerId);
+            } catch (_) {}
+            const coords = getMouseCoords(event);
+            
+            log(`开始拖动: (${coords.x}, ${coords.y})`, 'info');
+            sendMouseEvent('down', coords);
+        }
+
+        function handlePointerMove(event) {
             if (!ws || ws.readyState !== WebSocket.OPEN || !isMouseDown) {
                 return;
             }
 
+            event.preventDefault();
             // 节流：限制发送频率，避免卡顿
             const now = Date.now();
             if (now - lastMoveTime < moveThrottle) {
@@ -519,35 +570,27 @@
             lastMoveTime = now;
 
             const coords = getMouseCoords(event);
-            
-            ws.send(JSON.stringify({
-                type: 'mouse_event',
-                event_type: 'move',
-                x: coords.x,
-                y: coords.y
-            }));
+            sendMouseEvent('move', coords);
         }
 
-        function handleMouseUp(event) {
+        function handlePointerUp(event) {
             if (!ws || ws.readyState !== WebSocket.OPEN || !isMouseDown) {
                 return;
             }
 
+            event.preventDefault();
             isMouseDown = false;
+            try {
+                canvas.releasePointerCapture(event.pointerId);
+            } catch (_) {}
             const coords = getMouseCoords(event);
             
-            log(`鼠标释放: (${coords.x}, ${coords.y})`, 'info');
+            log(`结束拖动: (${coords.x}, ${coords.y})`, 'info');
             log(`等待验证结果...`, 'info');
             
             // 更新状态显示
             document.getElementById('verificationStatus').textContent = '验证中...';
-            
-            ws.send(JSON.stringify({
-                type: 'mouse_event',
-                event_type: 'up',
-                x: coords.x,
-                y: coords.y
-            }));
+            sendMouseEvent('up', coords);
         }
 
         function getMouseCoords(event) {
@@ -568,4 +611,3 @@
     </script>
 </body>
 </html>
-

@@ -24,6 +24,7 @@ import sys
 import aiohttp
 from collections import defaultdict
 from db_manager import db_manager
+from utils.critical_alerts import CriticalAlertService, sanitize_alert_text
 
 try:
     import certifi
@@ -493,6 +494,151 @@ class XianyuLive:
         else:
             return min(5 * self.connection_failures, 30)
 
+    def _normalize_show_browser(self, show_browser: bool, context: str) -> bool:
+        """Docker without a display cannot launch a headed browser."""
+        if show_browser and os.getenv('DOCKER_ENV') and not os.getenv('DISPLAY'):
+            logger.warning(f"【{self.cookie_id}】Docker环境未配置DISPLAY，{context}改用无头浏览器模式")
+            return False
+        return bool(show_browser)
+
+    @staticmethod
+    def _build_captcha_control_url(session_id: str) -> str:
+        """构建可供人工远程处理验证码的控制页地址。"""
+        public_base_url = os.getenv('PUBLIC_BASE_URL', '').strip().rstrip('/')
+        if public_base_url:
+            base_url = public_base_url
+        elif os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv'):
+            raise RuntimeError(
+                "Docker 环境必须配置 PUBLIC_BASE_URL，才能生成外部可访问的验证码控制链接"
+            )
+        else:
+            host = (os.getenv('SERVER_HOST') or os.getenv('PUBLIC_IP') or os.getenv('WEB_HOST') or 'localhost').strip()
+            if host.startswith(('http://', 'https://')):
+                base_url = host.rstrip('/')
+            else:
+                port = (os.getenv('WEB_PORT') or '8080').strip()
+                has_port = ':' in host and not host.startswith('[')
+                netloc = host if has_port or not port else f"{host}:{port}"
+                base_url = f"http://{netloc}".rstrip('/')
+
+        return f"{base_url}/api/captcha/control/{session_id}"
+
+    def _requires_human_recovery(self, status: str = None) -> bool:
+        """判断当前失败是否需要人工处理或风控冷却，避免立即重启刷接口。"""
+        status = status or getattr(self, 'last_token_refresh_status', None)
+        return status in {
+            "captcha_required",
+            "captcha_failed",
+            "captcha_error",
+            "captcha_manual_required",
+            "captcha_max_retries_exceeded",
+            "password_login_refresh_unavailable",
+            "password_login_refresh_failed",
+            "password_login_refresh_error",
+        }
+
+    async def send_critical_alert(
+        self,
+        alert_key: str,
+        title: str,
+        content: str,
+        cooldown_seconds: int = None,
+    ) -> str:
+        """通过账号所有者的 PushPlus 渠道发送低噪声关键告警。"""
+        try:
+            if cooldown_seconds is None:
+                try:
+                    cooldown_seconds = max(
+                        0,
+                        int(os.getenv("CRITICAL_ALERT_COOLDOWN_SECONDS", "1800")),
+                    )
+                except ValueError:
+                    cooldown_seconds = 1800
+
+            try:
+                max_attempts = max(
+                    1,
+                    int(os.getenv("CRITICAL_ALERT_MAX_ATTEMPTS", "3")),
+                )
+            except ValueError:
+                max_attempts = 3
+
+            service = CriticalAlertService(
+                db_manager,
+                max_attempts=max_attempts,
+            )
+            lock = getattr(self, "notification_lock", None)
+            if lock is None:
+                lock = asyncio.Lock()
+                self.notification_lock = lock
+
+            async with lock:
+                result = await service.send(
+                    self.cookie_id,
+                    alert_key,
+                    title,
+                    content,
+                    cooldown_seconds=cooldown_seconds,
+                )
+            logger.info(
+                f"【{self.cookie_id}】关键告警处理完成: key={alert_key}, result={result}"
+            )
+            return result
+        except Exception as alert_error:
+            logger.error(
+                f"【{self.cookie_id}】关键告警处理异常: {self._safe_str(alert_error)}"
+            )
+            return "error"
+
+    async def _send_manual_captcha_critical_alert(self, control_url: str) -> str:
+        content = (
+            f"账号 {self.cookie_id} 已触发闲鱼风控，Cookie 重载、自动重连和密码恢复"
+            f"均未完成恢复。请打开人工验证页处理滑块：\n{control_url}\n"
+            f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        return await self.send_critical_alert(
+            "captcha_manual_required",
+            "闲鱼账号需要人工滑块验证",
+            content,
+        )
+
+    async def _backoff_after_human_recovery_required(self, reason: str):
+        """风控/人工验证失败后进入长冷却，避免反复重启触发平台风控。"""
+        cooldown = self.captcha_failure_backoff
+        self.connection_failures = 0
+        self.current_token = None
+        self.last_token_refresh_status = "captcha_backoff"
+        self._set_connection_state(ConnectionState.FAILED, f"{reason}，等待{cooldown}秒后重试")
+        logger.warning(f"【{self.cookie_id}】{reason}，进入风控冷却 {cooldown} 秒，期间不重启实例")
+
+        try:
+            await self.send_critical_alert(
+                "account_recovery_failed",
+                "闲鱼账号自动恢复失败",
+                f"账号 {self.cookie_id} 自动恢复未成功，系统已暂停重连 "
+                f"{cooldown // 60} 分钟以避免加重风控。原因：{reason}",
+            )
+            await self.send_token_refresh_notification(
+                f"{reason}。系统已暂停重连 {cooldown // 60} 分钟，避免继续触发风控；请人工处理验证或配置账号密码后再启用。",
+                "captcha_backoff"
+            )
+        except Exception as notify_e:
+            logger.warning(f"【{self.cookie_id}】发送风控冷却通知失败: {self._safe_str(notify_e)}")
+
+        remaining = cooldown
+        while remaining > 0:
+            sleep_time = min(60, remaining)
+            try:
+                await asyncio.sleep(sleep_time)
+            except asyncio.CancelledError:
+                logger.warning(f"【{self.cookie_id}】风控冷却期间收到取消信号")
+                raise
+            remaining -= sleep_time
+            if remaining > 0:
+                logger.info(f"【{self.cookie_id}】风控冷却中，剩余 {remaining} 秒")
+
+        self._set_connection_state(ConnectionState.RECONNECTING, "风控冷却结束，准备重试")
+
     def _cleanup_instance_caches(self):
         """清理实例级别的缓存，防止内存泄漏"""
         try:
@@ -770,6 +916,12 @@ class XianyuLive:
         # 滑块验证相关
         self.captcha_verification_count = 0  # 滑块验证次数计数器
         self.max_captcha_verification_count = 3  # 最大滑块验证次数，防止无限递归
+        try:
+            self.captcha_failure_backoff = max(60, int(os.getenv('CAPTCHA_FAILURE_BACKOFF_SECONDS', '1800')))
+        except ValueError:
+            self.captcha_failure_backoff = 1800
+        self.last_token_refresh_status = None
+        self.last_captcha_verification_url = None
 
         # WebSocket连接监控
         self.connection_state = ConnectionState.DISCONNECTED  # 连接状态
@@ -934,6 +1086,460 @@ class XianyuLive:
         except Exception as e:
             logger.warning(f"【{self.cookie_id}】同步运行时Cookie失败: {self._safe_str(e)}")
             return False
+
+    def _response_has_risk_control(self, res_json, response_headers=None) -> bool:
+        """判断接口响应是否为风控/验证码响应，避免把惩罚 Cookie 持久化。"""
+        try:
+            if response_headers:
+                bxpunish = response_headers.get('bxpunish') or response_headers.get('Bxpunish')
+                if str(bxpunish or '').strip() == '1':
+                    return True
+
+            response_text = json.dumps(res_json, ensure_ascii=False, separators=(',', ':')).lower()
+            risk_keywords = [
+                'fail_sys_user_validate',
+                'rgv587_error',
+                'punish?x5secdata',
+                '_____tmd_____',
+                'purecaptcha',
+                'captcha',
+                '验证码',
+                '验证失败',
+                '哎哟喂',
+                '被挤爆',
+            ]
+            return any(keyword in response_text for keyword in risk_keywords)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】判断风控响应失败，按保守策略处理: {self._safe_str(e)}")
+            return True
+
+    def _extract_set_cookie_values(self, response_headers) -> dict:
+        """从响应头提取 Set-Cookie 字段。"""
+        new_cookies = {}
+        try:
+            if not response_headers or 'set-cookie' not in response_headers:
+                return new_cookies
+
+            if hasattr(response_headers, 'getall'):
+                set_cookie_headers = response_headers.getall('set-cookie', [])
+            else:
+                raw_header = response_headers.get('set-cookie', '')
+                set_cookie_headers = [raw_header] if raw_header else []
+
+            for cookie in set_cookie_headers:
+                if '=' in cookie:
+                    name, value = cookie.split(';')[0].split('=', 1)
+                    new_cookies[name.strip()] = value.strip()
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】解析 Set-Cookie 失败: {self._safe_str(e)}")
+        return new_cookies
+
+    async def _apply_response_cookies_if_safe(self, response_headers, res_json, source: str) -> bool:
+        """仅在非风控响应中同步并保存接口返回的 Cookie。"""
+        new_cookies = self._extract_set_cookie_values(response_headers)
+        if not new_cookies:
+            return False
+
+        if self._response_has_risk_control(res_json, response_headers):
+            logger.warning(
+                f"【{self.cookie_id}】{source}返回风控/验证码响应，跳过 Set-Cookie 落库，"
+                f"避免污染现有 Cookie；字段: {', '.join(sorted(new_cookies.keys()))}"
+            )
+            return False
+
+        self.cookies.update(new_cookies)
+        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+        self._sync_runtime_cookies(self.cookies_str)
+        await self.update_config_cookies()
+        logger.warning(f"【{self.cookie_id}】{source}已安全更新Cookie到数据库")
+        return True
+
+    async def _probe_token_with_cookie(self, cookies_str: str, source: str, max_retries: int = 1):
+        """验证候选 Cookie 是否能换到消息 WebSocket 所需 token。"""
+        if not cookies_str or not cookies_str.strip():
+            return False, cookies_str, "候选Cookie为空"
+
+        try:
+            working_cookies = trans_cookies(cookies_str)
+        except Exception as e:
+            return False, cookies_str, f"候选Cookie解析失败: {self._safe_str(e)}"
+
+        required_fields = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't']
+        missing_fields = [field for field in required_fields if not working_cookies.get(field)]
+        if missing_fields:
+            return False, cookies_str, f"候选Cookie缺少关键字段: {', '.join(missing_fields)}"
+
+        api_url = API_ENDPOINTS.get('token')
+        if not api_url:
+            return False, cookies_str, "Token API未配置"
+
+        data_val = '{"appKey":"444e9908a51d1cb236a27862abc769c9","deviceId":"' + self.device_id + '"}'
+
+        for attempt in range(max_retries + 1):
+            candidate_cookies_str = '; '.join([f"{k}={v}" for k, v in working_cookies.items()])
+            token = working_cookies.get('_m_h5_tk', '').split('_')[0] if working_cookies.get('_m_h5_tk') else ''
+            if not token:
+                return False, candidate_cookies_str, "候选Cookie缺少_m_h5_tk token"
+
+            timestamp = str(int(time.time() * 1000))
+            params = {
+                'jsv': '2.7.2',
+                'appKey': '34839810',
+                't': timestamp,
+                'sign': generate_sign(timestamp, token, data_val),
+                'v': '1.0',
+                'type': 'originaljson',
+                'accountSite': 'xianyu',
+                'dataType': 'json',
+                'timeout': '20000',
+                'api': 'mtop.taobao.idlemessage.pc.login.token',
+                'sessionOption': 'AutoLoginOnly',
+                'dangerouslySetWindvaneParams': '%5Bobject%20Object%5D',
+                'smToken': 'token',
+                'queryToken': 'sm',
+                'sm': 'sm',
+                'spm_cnt': 'a21ybx.im.0.0',
+                'spm_pre': 'a21ybx.home.sidebar.1.4c053da6vYwnmf',
+                'log_id': '4c053da6vYwnmf'
+            }
+            headers = {
+                'accept': 'application/json',
+                'accept-language': 'zh-CN,zh;q=0.9,en;q=0.8',
+                'cache-control': 'no-cache',
+                'content-type': 'application/x-www-form-urlencoded',
+                'pragma': 'no-cache',
+                'sec-ch-ua': '"Not;A=Brand";v="99", "Google Chrome";v="139", "Chromium";v="139"',
+                'sec-ch-ua-mobile': '?0',
+                'sec-ch-ua-platform': '"Windows"',
+                'sec-fetch-dest': 'empty',
+                'sec-fetch-mode': 'cors',
+                'sec-fetch-site': 'same-site',
+                'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                'referer': 'https://www.goofish.com/',
+                'origin': 'https://www.goofish.com',
+                'cookie': candidate_cookies_str
+            }
+
+            try:
+                connector = aiohttp.TCPConnector(ssl=self.ssl_context)
+                async with aiohttp.ClientSession(connector=connector) as session:
+                    async with session.post(
+                        api_url,
+                        params=params,
+                        data={'data': data_val},
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=20)
+                    ) as response:
+                        try:
+                            res_json = await response.json()
+                        except Exception:
+                            response_text = await response.text()
+                            return False, candidate_cookies_str, f"Token验证响应非JSON: {response_text[:120]}"
+
+                        if self._response_has_risk_control(res_json, response.headers):
+                            ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else res_json
+                            return False, candidate_cookies_str, f"Token验证触发风控/验证码: {ret_value}"
+
+                        safe_cookies = self._extract_set_cookie_values(response.headers)
+                        if safe_cookies:
+                            working_cookies.update(safe_cookies)
+                            candidate_cookies_str = '; '.join([f"{k}={v}" for k, v in working_cookies.items()])
+
+                        if isinstance(res_json, dict):
+                            ret_value = res_json.get('ret', [])
+                            if any('SUCCESS::调用成功' in str(ret) for ret in ret_value):
+                                if res_json.get('data', {}).get('accessToken'):
+                                    logger.info(f"【{self.cookie_id}】{source}候选Cookie通过token验证")
+                                    return True, candidate_cookies_str, "success"
+                                return False, candidate_cookies_str, "Token验证成功但缺少accessToken"
+
+                            if safe_cookies and attempt < max_retries:
+                                logger.info(f"【{self.cookie_id}】{source}候选Cookie获得新Set-Cookie，重试token验证")
+                                continue
+
+                            return False, candidate_cookies_str, f"Token验证失败: {ret_value}"
+
+                        return False, candidate_cookies_str, f"Token验证响应格式异常: {type(res_json).__name__}"
+            except Exception as e:
+                return False, candidate_cookies_str, f"Token验证异常: {self._safe_str(e)}"
+
+        return False, '; '.join([f"{k}={v}" for k, v in working_cookies.items()]), "Token验证重试耗尽"
+
+    async def _validate_password_refresh_cookie(self, cookies_str: str):
+        """密码登录产生的Cookie必须通过消息Token探测后才能保存。"""
+        validation_success, validated_cookies, validation_reason = await self._probe_token_with_cookie(
+            cookies_str,
+            "密码登录刷新Cookie",
+        )
+        if not validation_success:
+            self.last_token_refresh_status = "password_login_refresh_failed"
+            logger.error(
+                f"【{self.cookie_id}】密码登录Cookie未通过Token验证，保留旧Cookie: "
+                f"{sanitize_alert_text(validation_reason)}"
+            )
+            return None
+
+        self.last_token_refresh_status = "password_login_refresh_success"
+        logger.info(f"【{self.cookie_id}】密码登录Cookie已通过Token验证")
+        return validated_cookies
+
+    async def _handle_manual_captcha_verification(self, verification_url: str) -> str:
+        """通过现有远程控制页面让用户在同一个浏览器会话里完成验证。"""
+        playwright = None
+        browser = None
+        session_id = f"{self.cookie_id}-token"
+        control_url = self._build_captcha_control_url(session_id)
+
+        try:
+            from playwright.async_api import async_playwright
+            from urllib.parse import parse_qs, urlsplit
+            from utils.captcha_remote_control import captcha_controller
+
+            try:
+                max_wait_seconds = max(60, int(os.getenv('MANUAL_CAPTCHA_WAIT_SECONDS', '600')))
+            except ValueError:
+                max_wait_seconds = 600
+
+            logger.warning("=" * 60)
+            logger.warning(f"【{self.cookie_id}】已启动人工滑块验证流程")
+            logger.warning(f"【{self.cookie_id}】请访问控制页完成验证: {control_url}")
+            logger.warning("=" * 60)
+
+            log_captcha_event(
+                self.cookie_id,
+                "启动人工远程滑块验证",
+                None,
+                f"控制页: {control_url}, 验证URL: {verification_url}"
+            )
+
+            await self.send_token_refresh_notification(
+                f"检测到闲鱼风控/验证码，请打开远程控制页人工完成验证。控制页: {control_url}",
+                "captcha_manual_control",
+                verification_url=control_url
+            )
+
+            is_docker = os.getenv('DOCKER_ENV') or os.path.exists('/.dockerenv')
+            if is_docker:
+                logger.warning(f"【{self.cookie_id}】Docker环境下启动人工验证浏览器")
+
+                class DummyChildWatcher:
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        pass
+                    def is_active(self):
+                        return True
+                    def add_child_handler(self, *args, **kwargs):
+                        pass
+                    def remove_child_handler(self, *args, **kwargs):
+                        pass
+                    def attach_loop(self, *args, **kwargs):
+                        pass
+                    def close(self):
+                        pass
+                    def __del__(self):
+                        pass
+
+                class DockerEventLoopPolicy(asyncio.DefaultEventLoopPolicy):
+                    def get_child_watcher(self):
+                        return DummyChildWatcher()
+
+                old_policy = asyncio.get_event_loop_policy()
+                asyncio.set_event_loop_policy(DockerEventLoopPolicy())
+                try:
+                    playwright = await asyncio.wait_for(async_playwright().start(), timeout=30.0)
+                finally:
+                    asyncio.set_event_loop_policy(old_policy)
+            else:
+                playwright = await asyncio.wait_for(async_playwright().start(), timeout=30.0)
+
+            browser_args = [
+                '--no-sandbox',
+                '--disable-setuid-sandbox',
+                '--disable-dev-shm-usage',
+                '--disable-accelerated-2d-canvas',
+                '--no-first-run',
+                '--no-zygote',
+                '--disable-gpu',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding',
+                '--disable-features=TranslateUI',
+                '--disable-ipc-flooding-protection',
+                '--disable-extensions',
+                '--disable-default-apps',
+                '--disable-sync',
+                '--disable-translate',
+                '--mute-audio',
+                '--no-default-browser-check',
+                '--no-pings'
+            ]
+            if os.getenv('DOCKER_ENV'):
+                browser_args.extend([
+                    '--disable-background-networking',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-hang-monitor',
+                    '--disable-popup-blocking',
+                    '--disable-prompt-on-repost',
+                    '--metrics-recording-only',
+                    '--safebrowsing-disable-auto-update',
+                    '--enable-automation',
+                    '--password-store=basic',
+                    '--use-mock-keychain'
+                ])
+
+            browser = await playwright.chromium.launch(headless=True, args=browser_args)
+            context = await browser.new_context(
+                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36',
+                viewport={'width': 1920, 'height': 1080}
+            )
+
+            challenge_x5secdata = ''
+            try:
+                challenge_x5secdata = parse_qs(urlsplit(verification_url).query).get('x5secdata', [''])[0]
+            except Exception as parse_e:
+                logger.warning(f"【{self.cookie_id}】解析验证URL中的x5secdata失败: {self._safe_str(parse_e)}")
+
+            cookies = []
+            for cookie_pair in self.cookies_str.split('; '):
+                if '=' not in cookie_pair:
+                    continue
+                name, value = cookie_pair.split('=', 1)
+                name = name.strip()
+                if challenge_x5secdata and name.lower() == 'x5secdata':
+                    continue
+                cookies.append({
+                    'name': name,
+                    'value': value.strip(),
+                    'domain': '.goofish.com',
+                    'path': '/'
+                })
+
+            if challenge_x5secdata:
+                cookies.append({
+                    'name': 'x5secdata',
+                    'value': challenge_x5secdata,
+                    'domain': '.goofish.com',
+                    'path': '/'
+                })
+                logger.info(f"【{self.cookie_id}】已将本次风控x5secdata临时写入验证浏览器上下文")
+
+            await context.add_cookies(cookies)
+            logger.info(f"【{self.cookie_id}】已设置 {len(cookies)} 个Cookie到人工验证浏览器")
+
+            page = await context.new_page()
+            try:
+                await page.goto(verification_url, wait_until='domcontentloaded', timeout=20000)
+            except Exception as goto_e:
+                if 'timeout' in self._safe_str(goto_e).lower():
+                    logger.warning(f"【{self.cookie_id}】验证页加载超时，继续尝试截图远程控制")
+                else:
+                    raise
+
+            await asyncio.sleep(2)
+            page_title = await page.title()
+            logger.info(f"【{self.cookie_id}】人工验证页已打开: title={page_title}, url={page.url}")
+
+            await captcha_controller.create_session(session_id, page)
+            logger.warning(f"【{self.cookie_id}】远程滑块控制会话已创建: {control_url}")
+            await self._send_manual_captcha_critical_alert(control_url)
+
+            start_time = time.time()
+            last_log_second = -1
+            while time.time() - start_time < max_wait_seconds:
+                if not captcha_controller.session_exists(session_id):
+                    logger.warning(f"【{self.cookie_id}】人工验证会话已被关闭")
+                    return None
+
+                if captcha_controller.is_completed(session_id):
+                    logger.success(f"【{self.cookie_id}】人工滑块验证已完成，开始提取Cookie并验证token")
+                    await asyncio.sleep(2)
+
+                    updated_cookies = await context.cookies()
+                    new_cookies_dict = {}
+                    for cookie in updated_cookies:
+                        name = cookie.get('name')
+                        value = cookie.get('value')
+                        if name and value is not None:
+                            new_cookies_dict[name] = value
+
+                    candidate_cookies_str = '; '.join([f"{k}={v}" for k, v in new_cookies_dict.items()])
+                    validation_success, validated_cookies_str, validation_reason = await self._probe_token_with_cookie(
+                        candidate_cookies_str,
+                        "人工滑块验证Cookie"
+                    )
+
+                    if not validation_success:
+                        logger.error(
+                            f"【{self.cookie_id}】人工验证后的Cookie仍未通过token验证，保留旧Cookie: "
+                            f"{validation_reason}"
+                        )
+                        log_captcha_event(
+                            self.cookie_id,
+                            "人工滑块验证后Cookie验证失败",
+                            False,
+                            validation_reason
+                        )
+                        await self.send_token_refresh_notification(
+                            f"人工滑块验证完成，但Cookie仍未通过token验证: {validation_reason}",
+                            "captcha_manual_cookie_invalid",
+                            verification_url=control_url
+                        )
+                        return None
+
+                    self._sync_runtime_cookies(validated_cookies_str)
+                    await self.update_config_cookies()
+                    logger.success(f"【{self.cookie_id}】人工验证Cookie已通过token验证并保存到数据库")
+                    log_captcha_event(
+                        self.cookie_id,
+                        "人工滑块验证成功并保存Cookie",
+                        True,
+                        f"cookies长度: {len(validated_cookies_str)}, 控制页: {control_url}"
+                    )
+                    await self.send_token_refresh_notification(
+                        "人工滑块验证成功，Cookie已通过token验证并保存",
+                        "captcha_manual_success"
+                    )
+                    return validated_cookies_str
+
+                elapsed = int(time.time() - start_time)
+                if elapsed and elapsed % 30 == 0 and elapsed != last_log_second:
+                    last_log_second = elapsed
+                    remaining = max_wait_seconds - elapsed
+                    logger.info(f"【{self.cookie_id}】等待人工滑块验证中，剩余 {remaining} 秒: {control_url}")
+
+                await asyncio.sleep(1)
+
+            logger.error(f"【{self.cookie_id}】人工滑块验证超时（{max_wait_seconds}秒）")
+            log_captcha_event(
+                self.cookie_id,
+                "人工滑块验证超时",
+                False,
+                f"等待{max_wait_seconds}秒未完成, 控制页: {control_url}"
+            )
+            return None
+
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】人工滑块验证流程异常: {self._safe_str(e)}")
+            log_captcha_event(
+                self.cookie_id,
+                "人工滑块验证异常",
+                False,
+                self._safe_str(e)[:200]
+            )
+            return None
+        finally:
+            try:
+                from utils.captcha_remote_control import captcha_controller
+                await captcha_controller.close_session(session_id)
+            except Exception as session_e:
+                logger.warning(f"【{self.cookie_id}】关闭人工验证会话失败: {self._safe_str(session_e)}")
+
+            try:
+                if browser or playwright:
+                    await self._async_close_browser(browser, playwright)
+            except Exception as cleanup_e:
+                logger.warning(f"【{self.cookie_id}】清理人工验证浏览器失败: {self._safe_str(cleanup_e)}")
 
     def _record_platform_shipment_confirmation(self, order_id: str, confirmed_at: float = None):
         """记录平台侧已确认发货，供后续自动发货流程复用。"""
@@ -1466,9 +2072,9 @@ class XianyuLive:
 
                         # 发送结果通知
                         if platform_shipment_confirmed and all_messages_sent and len(delivery_contents) > 1:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"多数量发货成功，共发送 {len(delivery_contents)} 个卡券", chat_id, order_id)
                         elif platform_shipment_confirmed and all_messages_sent:
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "发货成功", chat_id, order_id)
                         elif sent_count > 0 and not platform_shipment_confirmed:
                             confirm_error = '；'.join(dict.fromkeys(confirm_failure_reasons))
                             await self.send_delivery_failure_notification(
@@ -1476,7 +2082,8 @@ class XianyuLive:
                                 send_user_id,
                                 item_id,
                                 f"卡密已发送，但闲鱼订单仍是去发货：{confirm_error}",
-                                chat_id
+                                chat_id,
+                                order_id,
                             )
                         elif sent_count > 0:
                             await self.send_delivery_failure_notification(
@@ -1484,22 +2091,23 @@ class XianyuLive:
                                 send_user_id,
                                 item_id,
                                 f"卡密已发送 {sent_count}/{len(delivery_contents)} 条，但存在发送失败",
-                                chat_id
+                                chat_id,
+                                order_id,
                             )
                         else:
                             db_manager.release_order_delivery_claim(order_id, self.cookie_id)
-                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "卡密发送失败", chat_id)
+                            await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "卡密发送失败", chat_id, order_id)
                     else:
                         logger.warning(f'[{msg_time}] 【自动发货】未找到匹配的发货规则或获取发货内容失败')
                         db_manager.release_order_delivery_claim(order_id, self.cookie_id)
                         # 发送自动发货失败通知
-                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "未找到匹配的发货规则或获取发货内容失败", chat_id)
+                        await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, "未找到匹配的发货规则或获取发货内容失败", chat_id, order_id)
 
                 except Exception as e:
                     logger.error(f"自动发货处理异常: {self._safe_str(e)}")
                     db_manager.release_order_delivery_claim(order_id, self.cookie_id)
                     # 发送自动发货异常通知
-                    await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}", chat_id)
+                    await self.send_delivery_failure_notification(send_user_name, send_user_id, item_id, f"自动发货处理异常: {str(e)}", chat_id, order_id)
 
                 logger.info(f'[{msg_time}] 【{self.cookie_id}】订单锁释放: {lock_key}，自动发货处理完成')
 
@@ -1526,6 +2134,7 @@ class XianyuLive:
 
             # 检查滑块验证重试次数，防止无限递归
             if captcha_retry_count >= self.max_captcha_verification_count:
+                self.last_token_refresh_status = "captcha_max_retries_exceeded"
                 logger.error(f"【{self.cookie_id}】滑块验证重试次数已达上限 ({self.max_captcha_verification_count})，停止重试")
                 await self.send_token_refresh_notification(
                     f"滑块验证重试次数已达上限，请手动处理",
@@ -1685,23 +2294,8 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】  响应内容: {json.dumps(res_json, ensure_ascii=False, indent=2)}")
                     logger.info(f"【{self.cookie_id}】================================")
 
-                    # 检查并更新Cookie
-                    if 'set-cookie' in response.headers:
-                        new_cookies = {}
-                        for cookie in response.headers.getall('set-cookie', []):
-                            if '=' in cookie:
-                                name, value = cookie.split(';')[0].split('=', 1)
-                                new_cookies[name.strip()] = value.strip()
-
-                        # 更新cookies
-                        if new_cookies:
-                            self.cookies.update(new_cookies)
-                            # 生成新的cookie字符串
-                            self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                            self._sync_runtime_cookies(self.cookies_str)
-                            # 更新数据库中的Cookie
-                            await self.update_config_cookies()
-                            logger.warning("已更新Cookie到数据库")
+                    captcha_required = self._need_captcha_verification(res_json)
+                    await self._apply_response_cookies_if_safe(response.headers, res_json, "Token刷新API")
 
                     if isinstance(res_json, dict):
                         ret_value = res_json.get('ret', [])
@@ -1722,11 +2316,14 @@ class XianyuLive:
                                 return new_token
 
                     # 检查是否需要滑块验证
-                    if self._need_captcha_verification(res_json):
+                    if captcha_required:
+                        self.last_token_refresh_status = "captcha_required"
                         logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
 
                         # 记录滑块验证检测到日志文件
                         verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
+                        if verification_url and verification_url != 'Token刷新时检测':
+                            self.last_captcha_verification_url = verification_url
                         log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
 
                         # 添加风控日志记录
@@ -1755,6 +2352,7 @@ class XianyuLive:
                             captcha_duration = time.time() - captcha_start_time
 
                             if new_cookies_str:
+                                self.last_token_refresh_status = "captcha_solved"
                                 logger.info(f"【{self.cookie_id}】滑块验证成功，准备重启实例...")
 
                                 # 更新风控日志为成功状态
@@ -1775,6 +2373,7 @@ class XianyuLive:
                                 # 重新尝试刷新token（递归调用，但有深度限制）
                                 return await self.refresh_token(captcha_retry_count + 1)
                             else:
+                                self.last_token_refresh_status = "captcha_failed"
                                 logger.error(f"【{self.cookie_id}】滑块验证失败")
 
                                 # 更新风控日志为失败状态
@@ -1792,6 +2391,7 @@ class XianyuLive:
                                 # 标记已发送通知（通知已在_handle_captcha_verification中发送）
                                 notification_sent = True
                         except Exception as captcha_e:
+                            self.last_token_refresh_status = "captcha_error"
                             logger.error(f"【{self.cookie_id}】滑块验证处理异常: {self._safe_str(captcha_e)}")
 
                             # 更新风控日志为异常状态
@@ -1830,6 +2430,13 @@ class XianyuLive:
                                 # 刷新失败时继续执行原有的失败处理逻辑
 
                     logger.error(f"【{self.cookie_id}】Token刷新失败: {res_json}")
+                    if self.last_token_refresh_status not in {
+                        "captcha_required",
+                        "captcha_failed",
+                        "captcha_error",
+                        "captcha_max_retries_exceeded",
+                    }:
+                        self.last_token_refresh_status = "failed"
 
                     # 清空当前token，确保下次重试时重新获取
                     self.current_token = None
@@ -1854,6 +2461,7 @@ class XianyuLive:
                     return None
 
         except Exception as e:
+            self.last_token_refresh_status = "exception"
             logger.error(f"Token刷新异常: {self._safe_str(e)}")
 
             # 清空当前token，确保下次重试时重新获取
@@ -1948,6 +2556,51 @@ class XianyuLive:
 
             logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
 
+            auto_solve_setting = os.getenv('AUTO_CAPTCHA_SOLVE_ENABLED')
+            if auto_solve_setting is None:
+                auto_solve_enabled = not (os.getenv('DOCKER_ENV') and not os.getenv('DISPLAY'))
+            else:
+                auto_solve_enabled = auto_solve_setting.strip().lower() in {'1', 'true', 'yes', 'on'}
+
+            if not auto_solve_enabled:
+                logger.warning(
+                    f"【{self.cookie_id}】自动滑块未启用，先尝试使用已配置账号密码恢复Cookie"
+                )
+                try:
+                    password_refresh_success = await self._try_password_login_refresh("风控验证")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as password_refresh_error:
+                    password_refresh_success = False
+                    logger.error(
+                        f"【{self.cookie_id}】风控验证前密码恢复异常: "
+                        f"{self._safe_str(password_refresh_error)}"
+                    )
+
+                if password_refresh_success:
+                    logger.info(
+                        f"【{self.cookie_id}】密码恢复成功，跳过人工滑块流程"
+                    )
+                    return self.cookies_str
+
+                self.last_token_refresh_status = "captcha_manual_required"
+                logger.warning(
+                    f"【{self.cookie_id}】检测到闲鱼风控/验证码，当前环境未启用自动滑块处理，"
+                    f"进入人工远程验证流程。验证URL: {verification_url}"
+                )
+                log_captcha_event(
+                    self.cookie_id,
+                    "检测到滑块验证并启用人工远程处理",
+                    None,
+                    f"环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}, URL: {verification_url}"
+                )
+                manual_cookies_str = await self._handle_manual_captcha_verification(verification_url)
+                if manual_cookies_str:
+                    return manual_cookies_str
+
+                logger.warning(f"【{self.cookie_id}】人工远程滑块验证未完成或未通过")
+                return None
+
             # 使用滑块验证器（独立实例，解决并发冲突）
             try:
                 # 使用集成的滑块验证方法（无需猴子补丁）
@@ -1965,6 +2618,7 @@ class XianyuLive:
                     show_browser = bool(cookie_details.get('show_browser', False)) if cookie_details else False
                 except Exception as config_e:
                     logger.warning(f"【{self.cookie_id}】读取滑块浏览器模式配置失败，默认使用无头模式: {self._safe_str(config_e)}")
+                show_browser = self._normalize_show_browser(show_browser, "滑块验证")
 
                 attempt_modes = [show_browser]
                 if not show_browser and not os.getenv('DOCKER_ENV'):
@@ -2340,6 +2994,7 @@ class XianyuLive:
             account_info = db_manager.get_cookie_details(self.cookie_id)
             
             if not account_info:
+                self.last_token_refresh_status = "password_login_refresh_unavailable"
                 logger.error(f"【{self.cookie_id}】无法获取账号信息")
                 return False
             
@@ -2355,9 +3010,11 @@ class XianyuLive:
             username = account_info.get('username', '')
             password = account_info.get('password', '')
             show_browser = account_info.get('show_browser', False)
+            show_browser = self._normalize_show_browser(show_browser, "密码登录")
             
             # 检查是否配置了用户名和密码
             if not username or not password:
+                self.last_token_refresh_status = "password_login_refresh_unavailable"
                 logger.warning(f"【{self.cookie_id}】未配置用户名或密码，跳过密码登录刷新")
                 await self.send_token_refresh_notification(
                     f"检测到{trigger_reason}，但未配置用户名或密码，无法自动刷新Cookie",
@@ -2395,17 +3052,16 @@ class XianyuLive:
             
             if result:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
-                logger.info(f"【{self.cookie_id}】Cookie内容: {result}")
-                
-                # 打印密码登录获取的Cookie字段详情
+
+                # 仅记录字段名和长度，避免Cookie值进入日志。
                 logger.info(f"【{self.cookie_id}】========== 密码登录Cookie字段详情 ==========")
                 logger.info(f"【{self.cookie_id}】Cookie字段数: {len(result)}")
                 logger.info(f"【{self.cookie_id}】Cookie字段列表:")
                 for i, (key, value) in enumerate(result.items(), 1):
-                    if len(str(value)) > 50:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {str(value)[:30]}...{str(value)[-20:]} (长度: {len(str(value))})")
-                    else:
-                        logger.info(f"【{self.cookie_id}】  {i:2d}. {key}: {value}")
+                    logger.info(
+                        f"【{self.cookie_id}】  {i:2d}. {key}: "
+                        f"{'存在' if value else '为空'} (长度: {len(str(value)) if value else 0})"
+                    )
                 
                 # 检查关键字段
                 important_keys = ['unb', '_m_h5_tk', '_m_h5_tk_enc', 'cookie2', 't', 'sgcookie', 'cna']
@@ -2420,7 +3076,14 @@ class XianyuLive:
                 
                 # 将cookie字典转换为字符串格式
                 new_cookies_str = '; '.join([f"{k}={v}" for k, v in result.items()])
-                logger.info(f"【{self.cookie_id}】Cookie字符串格式: {new_cookies_str[:200]}..." if len(new_cookies_str) > 200 else f"【{self.cookie_id}】Cookie字符串格式: {new_cookies_str}")
+                logger.info(f"【{self.cookie_id}】Cookie字符串长度: {len(new_cookies_str)}")
+
+                validated_cookies_str = await self._validate_password_refresh_cookie(
+                    new_cookies_str
+                )
+                if not validated_cookies_str:
+                    return False
+                new_cookies_str = validated_cookies_str
                 
                 # 记录密码登录时间，防止重复登录
                 XianyuLive._last_password_login_time[self.cookie_id] = time.time()
@@ -2442,10 +3105,12 @@ class XianyuLive:
                     return False
                     
             else:
+                self.last_token_refresh_status = "password_login_refresh_failed"
                 logger.warning(f"【{self.cookie_id}】密码登录失败，未获取到Cookie")
                 return False
 
         except Exception as refresh_e:
+            self.last_token_refresh_status = "password_login_refresh_error"
             logger.error(f"【{self.cookie_id}】Cookie刷新或实例重启失败: {self._safe_str(refresh_e)}")
             import traceback
             logger.error(f"【{self.cookie_id}】详细堆栈:\n{traceback.format_exc()}")
@@ -3189,23 +3854,7 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        self._sync_runtime_cookies(self.cookies_str)
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
+                await self._apply_response_cookies_if_safe(response.headers, res_json, "商品详情API")
 
                 logger.warning(f"商品信息获取成功: {res_json}")
                 # 检查返回状态
@@ -4763,7 +5412,8 @@ class XianyuLive:
                     send_user_id=buyer_id or "unknown",
                     item_id=item_id or "未知商品",
                     error_message=f"卡密已发，但平台确认发货补偿超过24小时仍未成功：{order_id}",
-                    chat_id=chat_id
+                    chat_id=chat_id,
+                    order_id=order_id,
                 )
                 continue
 
@@ -4785,7 +5435,8 @@ class XianyuLive:
                     send_user_id=buyer_id or "unknown",
                     item_id=item_id or "未知商品",
                     error_message=f"卡密已发，但平台确认发货停止补偿：{error_message}",
-                    chat_id=chat_id
+                    chat_id=chat_id,
+                    order_id=order_id,
                 )
                 continue
 
@@ -4799,9 +5450,36 @@ class XianyuLive:
                 f"【{self.cookie_id}】订单 {order_id} 补偿确认发货失败，将在 {delay_seconds} 秒后重试: {error_message}"
             )
 
-    async def send_delivery_failure_notification(self, send_user_name: str, send_user_id: str, item_id: str, error_message: str, chat_id: str = None):
+    async def send_delivery_failure_notification(
+        self,
+        send_user_name: str,
+        send_user_id: str,
+        item_id: str,
+        error_message: str,
+        chat_id: str = None,
+        order_id: str = None,
+    ):
         """发送自动发货失败通知"""
         try:
+            result_text = str(error_message or "未知失败")
+            is_success = result_text.startswith(("发货成功", "多数量发货成功"))
+            if not is_success:
+                alert_context = order_id or ":".join(
+                    str(value or "unknown")
+                    for value in (chat_id, item_id, send_user_id)
+                )
+                await self.send_critical_alert(
+                    f"delivery_failure:{alert_context}",
+                    "闲鱼自动发货需要人工处理",
+                    f"账号：{self.cookie_id}\n"
+                    f"订单：{order_id or '未知'}\n"
+                    f"商品：{item_id or '未知'}\n"
+                    f"买家：{send_user_name or '未知'} ({send_user_id or '未知'})\n"
+                    f"聊天：{chat_id or '未知'}\n"
+                    f"失败原因：{result_text}\n"
+                    f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+                )
+
             from db_manager import db_manager
 
             # 获取当前账号的通知配置
@@ -4817,7 +5495,7 @@ class XianyuLive:
                                  f"买家: {send_user_name} (ID: {send_user_id})\n" \
                                  f"商品ID: {item_id}\n" \
                                  f"聊天ID: {chat_id or '未知'}\n" \
-                                 f"结果: {error_message}\n" \
+                                 f"结果: {result_text}\n" \
                                  f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
                                  f"请及时处理！"
 
@@ -6627,6 +7305,22 @@ class XianyuLive:
                 else:
                     logger.info(f"【{target_cookie_id}】{cookie_name}: [不存在]")
 
+            validation_success, validated_cookies_str, validation_reason = await self._probe_token_with_cookie(
+                real_cookies_str,
+                "扫码登录真实Cookie"
+            )
+            if not validation_success:
+                logger.error(
+                    f"【{target_cookie_id}】扫码登录真实Cookie未通过token验证，保留数据库中的旧Cookie: "
+                    f"{validation_reason}"
+                )
+                return False
+
+            if validated_cookies_str != real_cookies_str:
+                real_cookies_str = validated_cookies_str
+                real_cookies_dict = trans_cookies(real_cookies_str)
+                logger.info(f"【{target_cookie_id}】扫码登录真实Cookie验证后已合并安全Set-Cookie，字段数: {len(real_cookies_dict)}")
+
             # 保存真实Cookie到数据库
             from db_manager import db_manager
             
@@ -6926,6 +7620,22 @@ class XianyuLive:
                     logger.info(f"【{self.cookie_id}】  ✅ {key}: {'存在' if val else '为空'} (长度: {len(str(val)) if val else 0})")
                 else:
                     logger.info(f"【{self.cookie_id}】  ❌ {key}: 缺失")
+
+            validation_success, validated_cookies_str, validation_reason = await self._probe_token_with_cookie(
+                real_cookies_str,
+                "浏览器页面刷新Cookie"
+            )
+            if not validation_success:
+                logger.error(
+                    f"【{self.cookie_id}】浏览器页面刷新Cookie未通过token验证，保留旧Cookie: "
+                    f"{validation_reason}"
+                )
+                return False
+
+            if validated_cookies_str != real_cookies_str:
+                real_cookies_str = validated_cookies_str
+                real_cookies_dict = trans_cookies(real_cookies_str)
+                logger.info(f"【{self.cookie_id}】浏览器页面刷新Cookie验证后已合并安全Set-Cookie，字段数: {len(real_cookies_dict)}")
 
             # 检查Cookie是否有有效更新
             changed_cookies = []
@@ -7234,11 +7944,31 @@ class XianyuLive:
             # 获取并打印当前页面标题
             page_title = await page.title()
             logger.info(f"【{self.cookie_id}】当前页面标题: {page_title}")
+            page_url = page.url
+            if self._response_has_risk_control({'title': page_title, 'url': page_url}):
+                logger.error(f"【{self.cookie_id}】浏览器刷新进入风控/验证码页面，保留旧Cookie: title={page_title}, url={page_url}")
+                return False
 
             # 构造新的Cookie字典
             new_cookies_dict = {}
             for cookie in updated_cookies:
                 new_cookies_dict[cookie['name']] = cookie['value']
+            candidate_cookies_str = '; '.join([f"{k}={v}" for k, v in new_cookies_dict.items()])
+
+            validation_success, validated_cookies_str, validation_reason = await self._probe_token_with_cookie(
+                candidate_cookies_str,
+                "浏览器刷新Cookie"
+            )
+            if not validation_success:
+                logger.error(
+                    f"【{self.cookie_id}】浏览器刷新Cookie未通过token验证，保留旧Cookie: "
+                    f"{validation_reason}"
+                )
+                return False
+
+            if validated_cookies_str != candidate_cookies_str:
+                new_cookies_dict = trans_cookies(validated_cookies_str)
+                logger.info(f"【{self.cookie_id}】浏览器刷新Cookie验证后已合并安全Set-Cookie，字段数: {len(new_cookies_dict)}")
 
             # 检查Cookie变化
             changed_cookies = []
@@ -8696,10 +9426,18 @@ class XianyuLive:
                         # 更新连接状态为重连中
                         self._set_connection_state(ConnectionState.RECONNECTING, f"连接关闭，第{self.connection_failures}次重连")
 
+                    current_refresh_status = getattr(self, 'last_token_refresh_status', None)
+                    if self._requires_human_recovery(current_refresh_status):
+                        await self._backoff_after_human_recovery_required(
+                            f"账号触发闲鱼风控/验证且自动处理失败（状态: {current_refresh_status}）"
+                        )
+                        continue
+
                     # 检查是否超过最大失败次数
                     if self.connection_failures >= self.max_connection_failures:
                         self._set_connection_state(ConnectionState.FAILED, f"连续失败{self.max_connection_failures}次")
                         logger.warning(f"【{self.cookie_id}】连续失败{self.max_connection_failures}次，尝试通过密码登录刷新Cookie...")
+                        pre_refresh_status = getattr(self, 'last_token_refresh_status', None)
                         
                         try:
                             # 调用统一的密码登录刷新方法
@@ -8715,10 +9453,29 @@ class XianyuLive:
                                 await asyncio.sleep(2)
                                 continue
                             else:
+                                post_refresh_status = getattr(self, 'last_token_refresh_status', None)
+                                if self._requires_human_recovery(pre_refresh_status) or self._requires_human_recovery(post_refresh_status):
+                                    await self._backoff_after_human_recovery_required(
+                                        f"账号触发闲鱼风控/验证且自动恢复失败（状态: {post_refresh_status or pre_refresh_status}）"
+                                    )
+                                    continue
                                 logger.warning(f"【{self.cookie_id}】❌ 密码登录刷新失败，将重启实例...")
                         except Exception as refresh_e:
                             logger.error(f"【{self.cookie_id}】密码登录刷新过程异常: {self._safe_str(refresh_e)}")
+                            if self._requires_human_recovery(pre_refresh_status):
+                                await self._backoff_after_human_recovery_required(
+                                    f"账号触发闲鱼风控/验证且密码登录刷新异常（状态: {pre_refresh_status}）"
+                                )
+                                continue
                             logger.warning(f"【{self.cookie_id}】将重启实例...")
+
+                        await self.send_critical_alert(
+                            "connection_recovery_failed",
+                            "闲鱼消息连接自动恢复失败",
+                            f"账号 {self.cookie_id} 的 WebSocket 已连续失败 "
+                            f"{self.max_connection_failures} 次，密码刷新也未恢复。"
+                            f"系统将继续重启实例，请检查账号登录状态。",
+                        )
                         
                         # 如果密码登录刷新失败或异常，则重启实例
                         logger.error(f"【{self.cookie_id}】准备重启实例...")
@@ -8969,23 +9726,7 @@ class XianyuLive:
             ) as response:
                 res_json = await response.json()
 
-                # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
-                    new_cookies = {}
-                    for cookie in response.headers.getall('set-cookie', []):
-                        if '=' in cookie:
-                            name, value = cookie.split(';')[0].split('=', 1)
-                            new_cookies[name.strip()] = value.strip()
-
-                    # 更新cookies
-                    if new_cookies:
-                        self.cookies.update(new_cookies)
-                        # 生成新的cookie字符串
-                        self.cookies_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
-                        self._sync_runtime_cookies(self.cookies_str)
-                        # 更新数据库中的Cookie
-                        await self.update_config_cookies()
-                        logger.warning("已更新Cookie到数据库")
+                await self._apply_response_cookies_if_safe(response.headers, res_json, "商品列表API")
 
                 logger.info(f"商品信息获取响应: {res_json}")
 

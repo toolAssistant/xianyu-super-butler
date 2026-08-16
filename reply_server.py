@@ -998,7 +998,9 @@ async def _process_pushed_qr_login_cookies(
     )
 
     if not refresh_success:
-        db_manager.update_cookie_account_info(target_account_id, cookie_value=cookies, user_id=user_id)
+        message = f"账号 {target_account_id} 扫码Cookie未通过真实Cookie/token验证，已保留旧Cookie"
+        await _notify_qr_push_result(user_id, settings, "闲鱼扫码登录未更新", message)
+        raise ValueError(message)
 
     updated_cookie_info = db_manager.get_cookie_by_id(target_account_id)
     real_cookies = (updated_cookie_info or {}).get('cookies_str') or cookies
@@ -3752,24 +3754,33 @@ async def _fallback_save_qr_cookie(account_id: str, cookies: str, user_id: int, 
     try:
         log_with_user('warning', f"降级处理 - 保存原始扫码cookie: {account_id}, 原因: {error_reason}", current_user)
 
+        if not is_new_account:
+            existing_cookie = db_manager.get_cookie_by_id(account_id) or {}
+            existing_cookie_value = existing_cookie.get('cookies_str') or existing_cookie.get('value') or ''
+            log_with_user(
+                'warning',
+                f"降级处理 - 现有账号保留原Cookie，不使用未验证的扫码Cookie覆盖: {account_id}",
+                current_user
+            )
+            return {
+                'account_id': account_id,
+                'is_new_account': False,
+                'real_cookie_refreshed': False,
+                'fallback_reason': error_reason,
+                'preserved_existing_cookie': True,
+                'cookie_length': len(existing_cookie_value)
+            }
+
         # 保存原始扫码cookie到数据库
         if is_new_account:
             db_manager.save_cookie(account_id, cookies, user_id)
             log_with_user('info', f"降级处理 - 新账号原始cookie已保存: {account_id}", current_user)
-        else:
-            # 现有账号使用 update_cookie_account_info 避免覆盖其他字段
-            db_manager.update_cookie_account_info(account_id, cookie_value=cookies)
-            log_with_user('info', f"降级处理 - 现有账号原始cookie已更新: {account_id}", current_user)
 
         # 添加到或更新cookie_manager
         if cookie_manager.manager:
             if is_new_account:
                 cookie_manager.manager.add_cookie(account_id, cookies)
                 log_with_user('info', f"降级处理 - 已将原始cookie添加到cookie_manager: {account_id}", current_user)
-            else:
-                # update_cookie_account_info 已经保存到数据库了，这里不需要再保存
-                cookie_manager.manager.update_cookie(account_id, cookies, save_to_db=False)
-                log_with_user('info', f"降级处理 - 已更新cookie_manager中的原始cookie: {account_id}", current_user)
 
         return {
             'account_id': account_id,

@@ -242,6 +242,18 @@ class RetryStrategyStats:
 strategy_stats = RetryStrategyStats()
 
 class XianyuSliderStealth:
+
+    @staticmethod
+    def _should_wait_for_human_verification(
+        show_browser: bool, verification_url: Optional[str] = None
+    ) -> bool:
+        """Keep the login context alive when the user has an external verification URL."""
+        return bool(show_browser or verification_url)
+
+    @staticmethod
+    def _get_browser_executable_path() -> Optional[str]:
+        executable = os.getenv('PLAYWRIGHT_CHROMIUM_EXECUTABLE', '').strip()
+        return executable if executable and os.path.isfile(executable) else None
     
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True):
         self.user_id = user_id
@@ -3090,18 +3102,28 @@ class XianyuSliderStealth:
             
             # 启动浏览器
             playwright = sync_playwright().start()
+            launch_options = {
+                'headless': not show_browser,
+                'args': browser_args,
+                'viewport': {'width': 1980, 'height': 1024},
+                'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
+                'locale': 'zh-CN',
+                'accept_downloads': True,
+                'ignore_https_errors': True,
+                'extra_http_headers': {
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                },
+            }
+            browser_executable = self._get_browser_executable_path()
+            if browser_executable:
+                launch_options['executable_path'] = browser_executable
+                logger.info(
+                    f"【{self.pure_user_id}】使用指定浏览器可执行文件: "
+                    f"{browser_executable}"
+                )
             context = playwright.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=not show_browser,
-                args=browser_args,
-                viewport={'width': 1980, 'height': 1024},
-                user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Safari/537.36',
-                locale='zh-CN',  # 设置浏览器区域为中文
-                accept_downloads=True,
-                ignore_https_errors=True,
-                extra_http_headers={
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'  # 设置HTTP Accept-Language header为中文
-                }
+                **launch_options,
             )
             logger.info(f"【{self.pure_user_id}】已设置浏览器语言为中文（zh-CN）")
             
@@ -3724,11 +3746,31 @@ class XianyuSliderStealth:
                             else:
                                 logger.warning(f"【{self.pure_user_id}】⚠️ notification_callback 未提供，无法发送通知")
                                 logger.warning(f"【{self.pure_user_id}】请确保调用 login_with_password_playwright 时传入 notification_callback 参数")
+
+                            if not self._should_wait_for_human_verification(
+                                show_browser, frame_url
+                            ):
+                                logger.warning(
+                                    f"【{self.pure_user_id}】没有可用的外部验证链接，"
+                                    "立即交回上层人工恢复流程"
+                                )
+                                return None
                             
                             # 持续等待用户完成二维码/人脸验证
                             logger.info(f"【{self.pure_user_id}】等待二维码/人脸验证完成...")
-                            check_interval = 10  # 每10秒检查一次
-                            max_wait_time = 450  # 最多等待7.5分钟
+                            check_interval = 5
+                            try:
+                                max_wait_time = max(
+                                    60,
+                                    int(
+                                        os.getenv(
+                                            'HUMAN_VERIFICATION_WAIT_SECONDS',
+                                            '600',
+                                        )
+                                    ),
+                                )
+                            except ValueError:
+                                max_wait_time = 600
                             waited_time = 0
                             
                             while waited_time < max_wait_time:

@@ -124,12 +124,13 @@ RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
 RUN node --version && npm --version
 
 COPY --from=builder /opt/venv /opt/venv
-COPY --from=builder /app /app
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin"
 
 RUN playwright install chromium && \
     playwright install-deps chromium
+
+COPY --from=builder /app /app
 
 # 创建必要的目录并设置权限
 RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
@@ -148,5 +149,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
+RUN chmod +x /app/entrypoint.sh
+
 # 启动命令
-CMD ["python", "/app/Start.py"]
+CMD ["/app/entrypoint.sh"]

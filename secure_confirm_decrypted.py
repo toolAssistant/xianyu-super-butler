@@ -44,6 +44,31 @@ class SecureConfirm:
         except:
             return "无法转换的对象"
 
+    def _is_risk_control_response(self, res_json, response_headers=None) -> bool:
+        """判断响应是否为风控/验证码，避免保存惩罚 Cookie。"""
+        try:
+            if response_headers:
+                bxpunish = response_headers.get('bxpunish') or response_headers.get('Bxpunish')
+                if str(bxpunish or '').strip() == '1':
+                    return True
+
+            response_text = json.dumps(res_json, ensure_ascii=False, separators=(',', ':')).lower()
+            risk_keywords = [
+                'fail_sys_user_validate',
+                'rgv587_error',
+                'punish?x5secdata',
+                '_____tmd_____',
+                'purecaptcha',
+                'captcha',
+                '验证码',
+                '验证失败',
+                '被挤爆',
+            ]
+            return any(keyword in response_text for keyword in risk_keywords)
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】判断风控响应失败，按保守策略处理: {self._safe_str(e)}")
+            return True
+
     def _is_session_invalid_error(self, error_msg):
         """判断是否为会话或令牌失效错误。"""
         if not error_msg:
@@ -160,7 +185,7 @@ class SecureConfirm:
                 res_json = await response.json()
 
                 # 检查并更新Cookie
-                if 'set-cookie' in response.headers:
+                if 'set-cookie' in response.headers and not self._is_risk_control_response(res_json, response.headers):
                     new_cookies = {}
                     for cookie in response.headers.getall('set-cookie', []):
                         if '=' in cookie:
@@ -175,6 +200,8 @@ class SecureConfirm:
                         # 更新数据库中的Cookie
                         await self._update_config_cookies()
                         logger.debug("已更新Cookie到数据库")
+                elif 'set-cookie' in response.headers:
+                    logger.warning(f"【{self.cookie_id}】自动确认发货响应触发风控/验证码，跳过Set-Cookie落库")
 
                 logger.info(f"【{self.cookie_id}】自动确认发货响应: {res_json}")
 
