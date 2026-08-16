@@ -4,7 +4,9 @@
 
 **Goal:** Expose the headed Chromium session used by Docker Playwright through a localhost-only VNC connection so Xianyu verification cookies remain in the recovery context.
 
-**Architecture:** The application entrypoint conditionally starts Xvfb, Fluxbox, and x11vnc before launching Python. Compose publishes VNC only on host loopback and persists Playwright profile data; the existing per-account `show_browser` flag selects headed Chromium.
+**Architecture:** The application entrypoint conditionally starts and supervises Xvfb, Fluxbox, and password-protected x11vnc before launching Python. An opt-in Compose override publishes VNC only on host loopback, mounts the password as a file-backed secret, and persists Playwright profile data; the existing per-account `show_browser` flag selects headed Chromium.
+
+> **Security review amendment:** The implemented design uses `docker-compose.vnc.yml`, `VNC_HOST_PORT`, and `VNC_PASSWORD_FILE`. These replace the original always-published port and plaintext `VNC_PASSWORD` environment proposal below.
 
 **Tech Stack:** POSIX shell, Docker Compose, Xvfb, Fluxbox, x11vnc, Python `unittest`, Playwright Chromium
 
@@ -41,7 +43,7 @@ def test_vnc_enabled_starts_local_display_stack(self):
     self.assertEqual(result.returncode, 0)
     self.assertIn("Xvfb :199 -screen 0 1980x1024x24 -ac +extension RANDR", calls)
     self.assertIn("fluxbox", calls)
-    self.assertIn("x11vnc -display :199 -forever -shared -nopw -rfbport 5900 -listen 0.0.0.0", calls)
+    self.assertIn("x11vnc -display :199 -forever -shared -rfbauth [AUTH_FILE] -rfbport 5900 -listen 0.0.0.0", calls)
     self.assertEqual(calls[-1], "python Start.py")
 ```
 
@@ -73,7 +75,11 @@ because `entrypoint.sh` does not yet manage VNC.
 
 - [ ] **Step 1: Add command validation and display startup**
 
-Implement a guarded VNC branch before `exec python Start.py`:
+Implement a guarded VNC branch before `exec python Start.py`. The initial
+startup sketch below is supplemented by the security amendment above: the final
+implementation reads `VNC_PASSWORD_FILE`, creates `VNC_AUTH_FILE`, rejects
+zombie process states through `ps`, and supervises all display children while
+Python runs.
 
 ```sh
 if [ "${ENABLE_VNC:-false}" = "true" ]; then
@@ -104,7 +110,7 @@ if [ "${ENABLE_VNC:-false}" = "true" ]; then
 
     fluxbox >/tmp/fluxbox.log 2>&1 &
     fluxbox_pid=$!
-    x11vnc -display "$DISPLAY" -forever -shared -nopw \
+    x11vnc -display "$DISPLAY" -forever -shared -rfbauth "$VNC_AUTH_FILE" \
         -rfbport "$VNC_PORT" -listen 0.0.0.0 >/tmp/x11vnc.log 2>&1 &
     x11vnc_pid=$!
 
@@ -130,36 +136,41 @@ Run: `sh -n entrypoint.sh`
 
 Expected: exit code 0 with no output.
 
-### Task 3: Wire Localhost-Only Compose Configuration
+### Task 3: Wire Opt-In Localhost-Only Compose Configuration
 
 **Files:**
 - Modify: `docker-compose.yml:11-22`
+- Create: `docker-compose.vnc.yml`
 - Modify: `docker-compose.yml:23-66`
 - Modify: `Dockerfile:145-146`
 
 - [ ] **Step 1: Publish and persist the browser session**
 
-Add the loopback-only VNC port and browser profile volume:
+Keep the base Compose service free of VNC bindings. Add the loopback-only VNC
+port and browser profile volume to `docker-compose.vnc.yml`:
 
 ```yaml
 ports:
   - "${WEB_PORT:-8080}:8080"
-  - "127.0.0.1:${VNC_PORT:-5900}:5900"
+  - "127.0.0.1:${VNC_HOST_PORT:-5900}:5900"
 volumes:
   - ./browser_data:/app/browser_data:rw
 ```
 
 - [ ] **Step 2: Pass VNC configuration to the container**
 
-Add these environment entries:
+Add these entries to the VNC override:
 
 ```yaml
-- ENABLE_VNC=${ENABLE_VNC:-false}
+- ENABLE_VNC=true
 - VNC_SCREEN=${VNC_SCREEN:-1980x1024x24}
 - VNC_PORT=5900
+- VNC_PASSWORD_FILE=/run/secrets/vnc_password
 ```
 
-The container port stays 5900 while `${VNC_PORT}` controls only the host port.
+The container port stays 5900 while `${VNC_HOST_PORT}` controls only the host
+port. The password is mounted as a Compose secret from
+`${VNC_PASSWORD_FILE:-./data/vnc_password}`.
 
 - [ ] **Step 3: Document the optional container port**
 
@@ -167,7 +178,7 @@ Change the Dockerfile declaration to `EXPOSE 8080 5900`.
 
 - [ ] **Step 4: Validate Compose expansion**
 
-Run: `ENABLE_VNC=true docker compose config`
+Run: `docker compose -f docker-compose.yml -f docker-compose.vnc.yml config`
 
 Expected: VNC target port 5900 is published with host IP `127.0.0.1`, and
 `ENABLE_VNC` resolves to `true`.
@@ -180,8 +191,8 @@ Expected: VNC target port 5900 is published with host IP `127.0.0.1`, and
 
 - [ ] **Step 1: Enable VNC in local deployment configuration**
 
-Set `ENABLE_VNC=true` and `VNC_PORT=5900` in `.env` without changing existing
-secrets.
+Create ignored `data/vnc_password` with mode `0600`; optionally set
+`VNC_HOST_PORT=5900` in `.env`.
 
 - [ ] **Step 2: Enable headed mode for the target account**
 
@@ -201,7 +212,7 @@ Run:
 ```bash
 python3.11 -m unittest tests.test_entrypoint_vnc -v
 sh -n entrypoint.sh
-docker compose config
+docker compose -f docker-compose.yml -f docker-compose.vnc.yml config
 git diff --check
 ```
 
@@ -209,7 +220,7 @@ Expected: all commands exit 0.
 
 - [ ] **Step 4: Rebuild and recreate the application container**
 
-Run: `docker compose up -d --build --force-recreate xianyu-app`
+Run: `docker compose -f docker-compose.yml -f docker-compose.vnc.yml up -d --build --force-recreate xianyu-app`
 
 Expected: image builds and the container becomes healthy.
 
