@@ -40,6 +40,9 @@ class EntrypointVNCTests(unittest.TestCase):
             env = {
                 **os.environ,
                 "ENABLE_VNC": enable_vnc,
+                "DISPLAY": ":199",
+                "VNC_SCREEN": "1980x1024x24",
+                "VNC_PORT": "5900",
                 "CALL_LOG": str(log_path),
                 "PATH": str(bin_dir),
             }
@@ -92,7 +95,7 @@ class EntrypointVNCTests(unittest.TestCase):
         )
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("required command not found: x11vnc", completed.stderr)
+        self.assertEqual(completed.stderr.strip(), "required command not found: x11vnc")
         self.assertNotIn("python Start.py", calls)
 
 
