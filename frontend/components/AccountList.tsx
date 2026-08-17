@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
-import { AccountDetail, AIReplySettings } from '../types';
+import { AccountDetail, AIReplySettings, ManualRecoveryResponse, ManualRecoveryStatus } from '../types';
 import {
   getAccountDetails,
   updateAccountStatus,
@@ -14,15 +14,38 @@ import {
   updateAccountLoginInfo,
   updateAccountAISettings,
   getAllAISettings,
-  getAccountAISettings
+  getAccountAISettings,
+  startManualRecovery,
+  getManualRecovery,
+  cancelManualRecovery
 } from '../services/api';
 import {
   Plus, Power, Edit2, Trash2, QrCode, X, Check, Loader2,
   MessageSquare, RefreshCw, Save, User, Clock, MessageCircle,
-  Upload, Key, Eye, EyeOff, Bot, Settings
+  Upload, Key, Eye, EyeOff, Bot, Settings, TriangleAlert, XCircle
 } from 'lucide-react';
 
 type ModalType = 'edit' | 'ai-settings' | null;
+
+const RECOVERY_TERMINAL_STATES = new Set<ManualRecoveryStatus>([
+  'success',
+  'failed',
+  'timed_out',
+  'cancelled',
+  'noop',
+]);
+
+const RECOVERY_STATUS_LABELS: Record<ManualRecoveryStatus, string> = {
+  starting: '启动浏览器',
+  waiting_for_operator: '等待人工处理',
+  validating: '验证 Token',
+  reconnecting: '重连中',
+  success: '已恢复',
+  failed: '恢复失败',
+  timed_out: '恢复超时',
+  cancelled: '已取消',
+  noop: '连接正常',
+};
 
 const AccountList: React.FC = () => {
   const [accounts, setAccounts] = useState<AccountDetail[]>([]);
@@ -35,6 +58,9 @@ const AccountList: React.FC = () => {
   const [activeModal, setActiveModal] = useState<ModalType>(null);
   const [editingAccount, setEditingAccount] = useState<AccountDetail | null>(null);
   const qrPollTimerRef = useRef<number | null>(null);
+  const recoveryPollTimersRef = useRef<Record<string, number>>({});
+  const [recoveries, setRecoveries] = useState<Record<string, ManualRecoveryResponse>>({});
+  const [recoveryRequests, setRecoveryRequests] = useState<Record<string, boolean>>({});
 
   // 编辑表单状态
   const [editForm, setEditForm] = useState({
@@ -93,6 +119,54 @@ const AccountList: React.FC = () => {
     if (qrPollTimerRef.current !== null) {
       window.clearTimeout(qrPollTimerRef.current);
       qrPollTimerRef.current = null;
+    }
+  };
+
+  const clearRecoveryPolling = (accountId?: string) => {
+    if (accountId) {
+      const timer = recoveryPollTimersRef.current[accountId];
+      if (timer !== undefined) {
+        window.clearTimeout(timer);
+        delete recoveryPollTimersRef.current[accountId];
+      }
+      return;
+    }
+
+    Object.values(recoveryPollTimersRef.current).forEach(window.clearTimeout);
+    recoveryPollTimersRef.current = {};
+  };
+
+  const setRecovery = (accountId: string, recovery: ManualRecoveryResponse) => {
+    setRecoveries(current => ({ ...current, [accountId]: recovery }));
+  };
+
+  const scheduleRecoveryStatusCheck = (accountId: string, delay: number = 2000) => {
+    clearRecoveryPolling(accountId);
+    recoveryPollTimersRef.current[accountId] = window.setTimeout(() => {
+      void pollRecoveryStatus(accountId);
+    }, delay);
+  };
+
+  const pollRecoveryStatus = async (accountId: string) => {
+    try {
+      const recovery = await getManualRecovery(accountId);
+      setRecovery(accountId, recovery);
+      if (RECOVERY_TERMINAL_STATES.has(recovery.status)) {
+        clearRecoveryPolling(accountId);
+        if (recovery.status === 'success') {
+          void loadAccounts();
+        }
+        return;
+      }
+      scheduleRecoveryStatusCheck(accountId);
+    } catch (error) {
+      clearRecoveryPolling(accountId);
+      setRecovery(accountId, {
+        cookie_id: accountId,
+        status: 'failed',
+        message: error instanceof Error ? error.message : '查询人工恢复状态失败',
+        active: false,
+      });
     }
   };
 
@@ -177,8 +251,79 @@ const AccountList: React.FC = () => {
     loadAccounts();
     return () => {
       clearQRPolling();
+      clearRecoveryPolling();
     };
   }, []);
+
+  const handleManualRecovery = async (accountId: string) => {
+    const recoveryWindow = window.open('about:blank', '_blank');
+    if (recoveryWindow) {
+      recoveryWindow.opener = null;
+      recoveryWindow.document.title = '闲鱼人工恢复';
+    }
+    setRecoveryRequests(current => ({ ...current, [accountId]: true }));
+    setRecovery(accountId, {
+      cookie_id: accountId,
+      status: 'starting',
+      message: '正在启动人工恢复浏览器',
+      active: true,
+    });
+
+    try {
+      const recovery = await startManualRecovery(accountId);
+      setRecovery(accountId, recovery);
+
+      if (recovery.status === 'noop') {
+        recoveryWindow?.close();
+        alert(recovery.message);
+        return;
+      }
+
+      if (!recovery.novnc_url) {
+        recoveryWindow?.close();
+        throw new Error('后端未返回本机浏览器入口');
+      }
+
+      if (recoveryWindow) {
+        recoveryWindow.location.replace(recovery.novnc_url);
+      } else {
+        alert('浏览器窗口被拦截，请允许弹窗后再次点击人工恢复');
+      }
+
+      if (recovery.active) {
+        scheduleRecoveryStatusCheck(accountId, 1000);
+      }
+    } catch (error) {
+      recoveryWindow?.close();
+      clearRecoveryPolling(accountId);
+      const message = error instanceof Error ? error.message : '启动人工恢复失败';
+      setRecovery(accountId, {
+        cookie_id: accountId,
+        status: 'failed',
+        message,
+        active: false,
+      });
+      alert(message);
+    } finally {
+      setRecoveryRequests(current => ({ ...current, [accountId]: false }));
+    }
+  };
+
+  const handleCancelRecovery = async (accountId: string) => {
+    try {
+      clearRecoveryPolling(accountId);
+      const recovery = await cancelManualRecovery(accountId);
+      setRecovery(accountId, recovery);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '取消人工恢复失败';
+      setRecovery(accountId, {
+        cookie_id: accountId,
+        status: 'failed',
+        message,
+        active: false,
+      });
+    }
+  };
 
   const handleToggle = async (id: string, currentStatus: boolean) => {
     await updateAccountStatus(id, !currentStatus);
@@ -338,7 +483,7 @@ const AccountList: React.FC = () => {
       {/* Account Grid */}
       <div className="grid grid-cols-1 gap-6">
         {accounts.map((account) => (
-          <div key={account.id} className="ios-card p-6 rounded-[2rem] flex items-center justify-between group hover:border-[#FFE815] transition-all duration-300">
+          <div key={account.id} className="ios-card p-6 rounded-[2rem] flex flex-col lg:flex-row lg:items-center justify-between gap-5 group hover:border-[#FFE815] transition-all duration-300">
             <div className="flex items-center gap-8">
               <div className="relative">
                 <img
@@ -369,9 +514,45 @@ const AccountList: React.FC = () => {
                    {account.auto_confirm && <span className="text-xs bg-yellow-50 text-yellow-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><MessageSquare className="w-3 h-3"/> 自动回复</span>}
                    {account.pause_duration > 0 && <span className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded-lg font-bold flex items-center gap-1.5"><Clock className="w-3 h-3"/> 暂停{account.pause_duration}分钟</span>}
                 </div>
+                {recoveries[account.id] && (
+                  <div className={`mt-3 flex items-start gap-2 text-sm font-semibold ${
+                    recoveries[account.id].status === 'success' || recoveries[account.id].status === 'noop'
+                      ? 'text-green-700'
+                      : recoveries[account.id].status === 'failed' || recoveries[account.id].status === 'timed_out'
+                        ? 'text-red-600'
+                        : 'text-amber-700'
+                  }`}>
+                    <TriangleAlert className="w-4 h-4 mt-0.5 shrink-0" />
+                    <span className="break-words">
+                      {RECOVERY_STATUS_LABELS[recoveries[account.id].status]}：{recoveries[account.id].message}
+                    </span>
+                  </div>
+                )}
               </div>
             </div>
-            <div className="flex items-center gap-3">
+            <div className="flex flex-wrap items-center justify-end gap-2 self-end lg:self-auto">
+                <button
+                    onClick={() => handleManualRecovery(account.id)}
+                    disabled={Boolean(recoveryRequests[account.id])}
+                    className="h-11 px-3 rounded-lg border border-amber-300 bg-amber-50 hover:bg-amber-100 disabled:opacity-60 disabled:cursor-not-allowed transition-colors text-amber-800 font-bold text-sm flex items-center gap-2"
+                    title={recoveries[account.id]?.active ? '重新打开人工恢复窗口' : '人工恢复'}
+                >
+                    {recoveryRequests[account.id] ? (
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                    ) : (
+                      <TriangleAlert className="w-4 h-4" />
+                    )}
+                    {recoveries[account.id]?.active ? '打开恢复' : '人工恢复'}
+                </button>
+                {recoveries[account.id]?.active && (
+                  <button
+                      onClick={() => handleCancelRecovery(account.id)}
+                      className="w-11 h-11 rounded-lg hover:bg-red-50 transition-colors text-red-500 flex items-center justify-center"
+                      title="取消人工恢复"
+                  >
+                      <XCircle className="w-5 h-5" />
+                  </button>
+                )}
                 <button
                     onClick={() => openEditModal(account)}
                     className="p-3 rounded-xl hover:bg-gray-100 transition-colors text-gray-600"

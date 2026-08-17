@@ -3,7 +3,7 @@ import {
   LoginResponse, AccountDetail, Order, PaginatedResponse,
   AdminStats, Card, SystemSettings, ApiResponse, OrderAnalytics,
   Item, AIReplySettings, ShippingRule, ReplyRule, DefaultReply,
-  NotificationChannel, QRLoginPushSettings
+  NotificationChannel, QRLoginPushSettings, ManualRecoveryResponse
 } from '../types';
 
 // Auth
@@ -58,6 +58,18 @@ export const updateAccountStatus = async (id: string, enabled: boolean): Promise
 
 export const deleteAccount = async (id: string): Promise<any> => {
   return del(`/cookies/${id}`);
+};
+
+export const startManualRecovery = async (id: string): Promise<ManualRecoveryResponse> => {
+  return post(`/cookies/${encodeURIComponent(id)}/manual-recovery`, {});
+};
+
+export const getManualRecovery = async (id: string): Promise<ManualRecoveryResponse> => {
+  return get(`/cookies/${encodeURIComponent(id)}/manual-recovery`);
+};
+
+export const cancelManualRecovery = async (id: string): Promise<ManualRecoveryResponse> => {
+  return del(`/cookies/${encodeURIComponent(id)}/manual-recovery`);
 };
 
 export const updateAccountRemark = async (id: string, remark: string): Promise<any> => {

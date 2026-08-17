@@ -541,6 +541,7 @@ tmp_*.py
 quick_*.py
 fix_*.py
 test_*.py
+!tests/test_manual_recovery.py
 check_*.py
 debug_*.py
 

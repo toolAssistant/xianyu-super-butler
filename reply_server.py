@@ -30,6 +30,7 @@ from ai_reply_engine import ai_reply_engine
 from utils.qr_login import qr_login_manager
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
+from utils.manual_recovery import ManualRecoveryManager, XianyuManualRecoveryRuntime
 
 from loguru import logger
 
@@ -233,6 +234,9 @@ qr_login_push_watch_tasks = {}
 # 账号密码登录会话管理
 password_login_sessions = {}  # {session_id: {'account_id': str, 'account': str, 'password': str, 'show_browser': bool, 'status': str, 'verification_url': str, 'qr_code_url': str, 'slider_instance': object, 'task': asyncio.Task, 'timestamp': float}}
 password_login_locks = defaultdict(lambda: asyncio.Lock())
+
+# 人工恢复管理器按需创建，避免服务导入阶段初始化Playwright。
+manual_recovery_manager: Optional[ManualRecoveryManager] = None
 
 # 不再需要单独的密码初始化，由数据库初始化时处理
 
@@ -1504,7 +1508,7 @@ async def start_qr_login_push_background_task():
 
 @app.on_event("shutdown")
 async def stop_qr_login_push_background_task():
-    global qr_login_push_task
+    global qr_login_push_task, manual_recovery_manager
     tasks = []
     if qr_login_push_task and not qr_login_push_task.done():
         qr_login_push_task.cancel()
@@ -1519,6 +1523,19 @@ async def stop_qr_login_push_background_task():
 
     if tasks:
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    if manual_recovery_manager is not None:
+        active_cookie_ids = [
+            cookie_id
+            for cookie_id, session in manual_recovery_manager.sessions.items()
+            if session.status in {"starting", "waiting_for_operator", "validating", "reconnecting"}
+        ]
+        if active_cookie_ids:
+            await asyncio.gather(
+                *(manual_recovery_manager.cancel(cookie_id) for cookie_id in active_cookie_ids),
+                return_exceptions=True,
+            )
+        manual_recovery_manager = None
 
 # 提供前端静态文件
 import os
@@ -2631,7 +2648,7 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
         return []
 
     # 获取当前用户的cookies
-    user_id = current_user['user_id']
+    user_id = None if current_user.get('is_admin', False) else current_user['user_id']
     from db_manager import db_manager
     user_cookies = db_manager.get_all_cookies(user_id)
     return list(user_cookies.keys())
@@ -2646,7 +2663,7 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
     if cookie_manager.manager is None:
         return []
 
-    user_id = current_user['user_id']
+    user_id = None if current_user.get('is_admin', False) else current_user['user_id']
     from db_manager import db_manager
     user_cookies = db_manager.get_all_cookies(user_id)
 
@@ -2709,6 +2726,69 @@ class AccountLoginInfoUpdate(BaseModel):
     username: Optional[str] = None
     login_password: Optional[str] = None
     show_browser: Optional[bool] = None
+
+
+def _get_manual_recovery_manager() -> ManualRecoveryManager:
+    global manual_recovery_manager
+    if manual_recovery_manager is None:
+        manual_recovery_manager = ManualRecoveryManager(
+            XianyuManualRecoveryRuntime(),
+            timeout_seconds=_get_env_int("MANUAL_RECOVERY_TIMEOUT_SECONDS", 15 * 60),
+            poll_interval_seconds=_get_env_int("MANUAL_RECOVERY_POLL_SECONDS", 5),
+            novnc_url=os.getenv(
+                "MANUAL_RECOVERY_NOVNC_URL",
+                "http://127.0.0.1:6080/vnc.html?autoconnect=true&resize=scale",
+            ),
+        )
+    return manual_recovery_manager
+
+
+def _require_cookie_access(cid: str, current_user: Dict[str, Any]) -> Dict[str, Any]:
+    details = db_manager.get_cookie_details(cid)
+    if not details:
+        raise HTTPException(status_code=404, detail="账号不存在")
+    if current_user.get("is_admin", False):
+        return details
+    if int(details.get("user_id") or 0) != int(current_user["user_id"]):
+        raise HTTPException(status_code=403, detail="无权限操作该账号")
+    return details
+
+
+@app.post("/cookies/{cid}/manual-recovery")
+async def start_manual_recovery(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    account = _require_cookie_access(cid, current_user)
+    manager = _get_manual_recovery_manager()
+    return await manager.start(
+        cid,
+        owner_user_id=int(account.get("user_id") or current_user["user_id"]),
+    )
+
+
+@app.get("/cookies/{cid}/manual-recovery")
+async def get_manual_recovery(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_cookie_access(cid, current_user)
+    snapshot = _get_manual_recovery_manager().get(cid)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="该账号没有人工恢复会话")
+    return snapshot
+
+
+@app.delete("/cookies/{cid}/manual-recovery")
+async def cancel_manual_recovery(
+    cid: str,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    _require_cookie_access(cid, current_user)
+    snapshot = await _get_manual_recovery_manager().cancel(cid)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="该账号没有人工恢复会话")
+    return snapshot
 
 
 @app.put("/cookies/{cid}/login-info")

@@ -15,15 +15,19 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     r"token|password|x5secdata|x5sectag|x5sec"
     r")\s*[=:]\s*([^\s;&]+)"
 )
+_LINK_RE = re.compile(
+    r"(?i)(?:(?:https?://|www\.)[^\s<>\"']+|/api/captcha/control/[^\s<>\"']*)"
+)
 
 
 def sanitize_alert_text(value: object) -> str:
-    """Remove credentials and anti-bot values from operator-facing alerts."""
+    """Remove credentials, anti-bot values, and links from operator alerts."""
     text = str(value or "")
-    return _SENSITIVE_ASSIGNMENT_RE.sub(
+    redacted = _SENSITIVE_ASSIGNMENT_RE.sub(
         lambda match: f"{match.group(1)}=[REDACTED]",
         text,
     )
+    return _LINK_RE.sub("[LINK REMOVED]", redacted)
 
 
 def parse_channel_config(value: Any) -> Dict[str, Any]:

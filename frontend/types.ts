@@ -50,6 +50,28 @@ export interface AccountDetail {
   custom_prompts?: string;
 }
 
+export type ManualRecoveryStatus =
+  | 'starting'
+  | 'waiting_for_operator'
+  | 'validating'
+  | 'reconnecting'
+  | 'success'
+  | 'failed'
+  | 'timed_out'
+  | 'cancelled'
+  | 'noop';
+
+export interface ManualRecoveryResponse {
+  cookie_id: string;
+  status: ManualRecoveryStatus;
+  message: string;
+  active: boolean;
+  novnc_url?: string;
+  created_at?: number;
+  expires_at?: number;
+  updated_at?: number;
+}
+
 // Orders
 export type OrderStatus = 
   | 'processing'      

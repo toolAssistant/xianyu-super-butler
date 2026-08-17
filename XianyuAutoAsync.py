@@ -590,11 +590,13 @@ class XianyuLive:
             )
             return "error"
 
-    async def _send_manual_captcha_critical_alert(self, control_url: str) -> str:
+    async def _send_manual_captcha_critical_alert(self, reason: str) -> str:
         content = (
-            f"账号 {self.cookie_id} 已触发闲鱼风控，Cookie 重载、自动重连和密码恢复"
-            f"均未完成恢复。请打开人工验证页处理滑块：\n{control_url}\n"
-            f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}"
+            f"账号ID：{self.cookie_id}\n"
+            f"故障类型：闲鱼风控/验证码\n"
+            f"原因：{sanitize_alert_text(reason)}\n"
+            f"时间：{time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            "请到部署机管理平台点击人工恢复"
         )
         return await self.send_critical_alert(
             "captcha_manual_required",
@@ -814,7 +816,13 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】清理日志文件时出错: {self._safe_str(e)}")
             return 0
 
-    def __init__(self, cookies_str=None, cookie_id: str = "default", user_id: int = None):
+    def __init__(
+        self,
+        cookies_str=None,
+        cookie_id: str = "default",
+        user_id: int = None,
+        register_instance: bool = True,
+    ):
         """初始化闲鱼直播类"""
         logger.info(f"【{cookie_id}】开始初始化XianyuLive...")
 
@@ -953,7 +961,8 @@ class XianyuLive:
         self._init_order_status_handler()
 
         # 注册实例到类级别字典（用于API调用）
-        self._register_instance()
+        if register_instance:
+            self._register_instance()
 
     def _build_ssl_context(self):
         """构建统一的SSL上下文，优先使用certifi证书链。"""
@@ -1154,6 +1163,15 @@ class XianyuLive:
         logger.warning(f"【{self.cookie_id}】{source}已安全更新Cookie到数据库")
         return True
 
+    def _capture_captcha_verification_url(self, res_json: dict) -> str:
+        """Keep the newest risk URL in memory for operator-triggered recovery."""
+        data = res_json.get("data", {}) if isinstance(res_json, dict) else {}
+        risk_url = data.get("url") if isinstance(data, dict) else None
+        if isinstance(risk_url, str) and risk_url.strip():
+            self.last_captcha_verification_url = risk_url.strip()
+            return self.last_captcha_verification_url
+        return None
+
     async def _probe_token_with_cookie(self, cookies_str: str, source: str, max_retries: int = 1):
         """验证候选 Cookie 是否能换到消息 WebSocket 所需 token。"""
         if not cookies_str or not cookies_str.strip():
@@ -1237,6 +1255,7 @@ class XianyuLive:
                             return False, candidate_cookies_str, f"Token验证响应非JSON: {response_text[:120]}"
 
                         if self._response_has_risk_control(res_json, response.headers):
+                            self._capture_captcha_verification_url(res_json)
                             ret_value = res_json.get('ret', []) if isinstance(res_json, dict) else res_json
                             return False, candidate_cookies_str, f"Token验证触发风控/验证码: {ret_value}"
 
@@ -2321,10 +2340,8 @@ class XianyuLive:
                         logger.warning(f"【{self.cookie_id}】检测到需要滑块验证，开始处理...")
 
                         # 记录滑块验证检测到日志文件
-                        verification_url = res_json.get('data', {}).get('url', 'Token刷新时检测')
-                        if verification_url and verification_url != 'Token刷新时检测':
-                            self.last_captcha_verification_url = verification_url
-                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, f"触发场景: Token刷新, URL: {verification_url}")
+                        verification_url = self._capture_captcha_verification_url(res_json) or 'Token刷新时检测'
+                        log_captcha_event(self.cookie_id, "检测到滑块验证", None, "触发场景: Token刷新")
 
                         # 添加风控日志记录
                         log_id = None
@@ -2333,7 +2350,7 @@ class XianyuLive:
                             success = db_manager.add_risk_control_log(
                                 cookie_id=self.cookie_id,
                                 event_type='slider_captcha',
-                                event_description=f"检测到需要滑块验证，触发场景: Token刷新, URL: {verification_url}",
+                                event_description="检测到需要滑块验证，触发场景: Token刷新",
                                 processing_status='processing'
                             )
                             if success:
@@ -2555,6 +2572,7 @@ class XianyuLive:
                 return None
 
             logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
+            self.last_captcha_verification_url = verification_url
 
             auto_solve_setting = os.getenv('AUTO_CAPTCHA_SOLVE_ENABLED')
             if auto_solve_setting is None:
@@ -2586,19 +2604,15 @@ class XianyuLive:
                 self.last_token_refresh_status = "captcha_manual_required"
                 logger.warning(
                     f"【{self.cookie_id}】检测到闲鱼风控/验证码，当前环境未启用自动滑块处理，"
-                    f"进入人工远程验证流程。验证URL: {verification_url}"
+                    "等待操作员从部署机管理平台启动人工恢复"
                 )
                 log_captcha_event(
                     self.cookie_id,
-                    "检测到滑块验证并启用人工远程处理",
+                    "检测到滑块验证并等待管理平台人工恢复",
                     None,
-                    f"环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}, URL: {verification_url}"
+                    f"环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}"
                 )
-                manual_cookies_str = await self._handle_manual_captcha_verification(verification_url)
-                if manual_cookies_str:
-                    return manual_cookies_str
-
-                logger.warning(f"【{self.cookie_id}】人工远程滑块验证未完成或未通过")
+                await self._send_manual_captcha_critical_alert("风控验证")
                 return None
 
             # 使用滑块验证器（独立实例，解决并发冲突）
@@ -5096,23 +5110,24 @@ class XianyuLive:
                 logger.warning("未配置消息通知，跳过Token刷新通知")
                 return
 
+            safe_error_message = sanitize_alert_text(error_message)
+
             # 构造通知消息
             # 判断异常信息中是否包含"滑块验证成功"
             if "滑块验证成功" in error_message:
-                notification_msg = f"{error_message}\n\n" \
+                notification_msg = f"{safe_error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
             elif verification_url:
-                # 如果有验证链接，添加到消息中
-                notification_msg = f"{error_message}\n\n" \
+                notification_msg = f"{safe_error_message}\n\n" \
                                   f"账号: {self.cookie_id}\n" \
                                   f"时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n\n" \
-                                  f"验证链接: {verification_url}\n"
+                                  "请到部署机管理平台点击人工恢复\n"
             else:
                 notification_msg = f"Token刷新异常\n\n" \
                                   f"账号ID: {self.cookie_id}\n" \
                                   f"异常时间: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())}\n" \
-                                  f"异常信息: {error_message}\n\n" \
+                                  f"异常信息: {safe_error_message}\n\n" \
                                   f"请检查账号Cookie是否过期，如有需要请及时更新Cookie配置。\n"
 
             logger.info(f"准备发送Token刷新异常通知: {self.cookie_id}")

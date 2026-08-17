@@ -157,15 +157,30 @@ class CriticalAlertServiceTests(unittest.IsolatedAsyncioTestCase):
 
 
 class CriticalAlertSanitizerTests(unittest.TestCase):
-    def test_redacts_sensitive_assignments_but_keeps_control_url(self):
-        text = sanitize_alert_text(
-            "token=abc cookie2=def password:ghi x5secdata=jkl "
-            "_m_h5_tk=mno https://xianyu.example/control"
+    def test_captures_risk_url_from_token_response_in_memory(self):
+        live = XianyuLive.__new__(XianyuLive)
+        live.last_captcha_verification_url = None
+        risk_url = "https://h5api.m.goofish.com/punish?x5secdata=fresh"
+
+        captured = live._capture_captcha_verification_url(
+            {"data": {"url": risk_url}}
         )
 
-        for secret in ("abc", "def", "ghi", "jkl", "mno"):
+        self.assertEqual(captured, risk_url)
+        self.assertEqual(live.last_captcha_verification_url, risk_url)
+
+    def test_redacts_sensitive_assignments_and_removes_links(self):
+        text = sanitize_alert_text(
+            "token=abc cookie2=def password:ghi x5secdata=jkl "
+            "_m_h5_tk=mno https://xianyu.example/api/captcha/control/account-1-token?x5secdata=raw"
+        )
+
+        for secret in ("abc", "def", "ghi", "jkl", "mno", "raw"):
             self.assertNotIn(secret, text)
-        self.assertIn("https://xianyu.example/control", text)
+        self.assertNotIn("http://", text)
+        self.assertNotIn("https://", text)
+        self.assertNotIn("/api/captcha/control/", text)
+        self.assertIn("[LINK REMOVED]", text)
         self.assertIn("token=[REDACTED]", text)
 
     def test_headless_password_login_waits_only_with_external_verification_url(self):
@@ -302,36 +317,36 @@ class CriticalAlertBusinessIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("卡密发送失败", args[2])
         self.assertIn("item-1", args[2])
 
-    async def test_captcha_attempts_password_recovery_before_manual_flow(self):
+    async def test_captcha_defers_manual_recovery_to_management_platform(self):
         live = XianyuLive.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.cookies_str = "unb=1"
         live.last_token_refresh_status = None
+        live.last_captcha_verification_url = None
         call_order = []
 
         async def password_recovery(_reason):
             call_order.append("password")
             return False
 
-        async def manual_recovery(_url):
-            call_order.append("manual")
-            return None
-
         live._try_password_login_refresh = AsyncMock(side_effect=password_recovery)
-        live._handle_manual_captcha_verification = AsyncMock(
-            side_effect=manual_recovery
-        )
+        live._handle_manual_captcha_verification = AsyncMock(return_value=None)
+        live._send_manual_captcha_critical_alert = AsyncMock(return_value="sent")
+        verification_url = "https://h5api.m.goofish.com/punish?x5secdata=fresh"
 
         with patch.dict(os.environ, {"AUTO_CAPTCHA_SOLVE_ENABLED": "false"}), patch(
             "XianyuAutoAsync.log_captcha_event"
         ):
             result = await live._handle_captcha_verification(
-                {"data": {"url": "https://h5api.m.goofish.com/punish"}}
+                {"data": {"url": verification_url}}
             )
 
         self.assertIsNone(result)
-        self.assertEqual(call_order, ["password", "manual"])
+        self.assertEqual(call_order, ["password"])
+        self.assertEqual(live.last_captcha_verification_url, verification_url)
         live._try_password_login_refresh.assert_awaited_once_with("风控验证")
+        live._send_manual_captcha_critical_alert.assert_awaited_once_with("风控验证")
+        live._handle_manual_captcha_verification.assert_not_awaited()
 
     async def test_successful_password_recovery_skips_manual_captcha(self):
         live = XianyuLive.__new__(XianyuLive)
@@ -351,19 +366,21 @@ class CriticalAlertBusinessIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, live.cookies_str)
         live._handle_manual_captcha_verification.assert_not_awaited()
 
-    async def test_manual_captcha_alert_contains_only_control_url(self):
+    async def test_manual_captcha_alert_points_to_management_platform_without_link(self):
         live = XianyuLive.__new__(XianyuLive)
         live.cookie_id = "account-1"
         live.send_critical_alert = AsyncMock(return_value="sent")
-        control_url = "https://xianyu.example/api/captcha/control/account-1-token"
 
-        await live._send_manual_captcha_critical_alert(control_url)
+        await live._send_manual_captcha_critical_alert("风控验证")
 
         live.send_critical_alert.assert_awaited_once()
         args = live.send_critical_alert.await_args.args
         self.assertEqual(args[0], "captcha_manual_required")
-        self.assertIn(control_url, args[2])
-        self.assertNotIn("h5api.m.goofish.com", args[2])
+        self.assertIn("部署机管理平台", args[2])
+        self.assertIn("风控验证", args[2])
+        self.assertNotIn("http://", args[2])
+        self.assertNotIn("https://", args[2])
+        self.assertNotIn("/api/captcha/control/", args[2])
 
     async def test_password_refresh_cookie_must_pass_token_probe(self):
         live = XianyuLive.__new__(XianyuLive)
