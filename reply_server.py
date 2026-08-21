@@ -992,7 +992,8 @@ async def _process_pushed_qr_login_cookies(
     temp_instance = XianyuLive(
         cookies_str=cookies,
         cookie_id=target_account_id,
-        user_id=user_id
+        user_id=user_id,
+        register_instance=False,
     )
 
     refresh_success = await temp_instance.refresh_cookies_from_qr_login(
@@ -3205,7 +3206,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
                     temp_xianyu = XianyuLive(
                         cookies_str=cookies_str,
                         cookie_id=account_id,
-                        user_id=user_id
+                        user_id=user_id,
+                        register_instance=False,
                     )
                     
                     # 重置扫码登录Cookie刷新标志，确保账号密码登录后能立即刷新
@@ -3775,7 +3777,8 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
             temp_instance = XianyuLive(
                 cookies_str=cookies,
                 cookie_id=account_id,
-                user_id=user_id
+                user_id=user_id,
+                register_instance=False,
             )
 
             # 执行cookie刷新获取真实cookie
@@ -3900,7 +3903,8 @@ async def refresh_cookies_from_qr_login(
         temp_instance = XianyuLive(
             cookies_str=qr_cookies,
             cookie_id=cookie_id,
-            user_id=current_user['user_id']
+            user_id=current_user['user_id'],
+            register_instance=False,
         )
 
         # 执行cookie刷新
@@ -6293,7 +6297,11 @@ async def get_all_items_from_account(request: dict, _: None = Depends(require_au
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(
+            cookies_str,
+            cookie_id,
+            register_instance=False,
+        )
 
         # 调用获取所有商品信息的方法（自动分页）
         logger.info(f"开始获取账号 {cookie_id} 的所有商品信息")
@@ -6359,7 +6367,11 @@ async def get_items_by_page(request: dict, _: None = Depends(require_auth)):
 
         # 创建XianyuLive实例，传入正确的cookie_id
         from XianyuAutoAsync import XianyuLive
-        xianyu_instance = XianyuLive(cookies_str, cookie_id)
+        xianyu_instance = XianyuLive(
+            cookies_str,
+            cookie_id,
+            register_instance=False,
+        )
 
         # 调用获取指定页商品信息的方法
         logger.info(f"开始获取账号 {cookie_id} 第{page_number}页商品信息（每页{page_size}条）")

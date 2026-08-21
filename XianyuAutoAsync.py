@@ -895,7 +895,7 @@ class XianyuLive:
 
         # Cookie刷新定时任务
         self.cookie_refresh_task = None
-        self.cookie_refresh_interval = 1200  # 1小时 = 3600秒
+        self.cookie_refresh_interval = self.token_refresh_interval
         self.last_cookie_refresh_time = 0
         self.cookie_refresh_lock = asyncio.Lock()  # 使用Lock防止重复执行Cookie刷新
         self.cookie_refresh_enabled = True  # 是否启用Cookie刷新功能

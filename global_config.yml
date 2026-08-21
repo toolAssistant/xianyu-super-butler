@@ -62,8 +62,8 @@ MANUAL_MODE:
   timeout: 3600
   toggle_keywords: []
 MESSAGE_EXPIRE_TIME: 300000
-TOKEN_REFRESH_INTERVAL: 3600  # 从3600秒(1小时)增加到72000秒(20小时)
-TOKEN_RETRY_INTERVAL: 600    # 从300秒(5分钟)增加到7200秒(2小时)
+TOKEN_REFRESH_INTERVAL: 72000  # 20小时，避免高频刷新触发平台风控
+TOKEN_RETRY_INTERVAL: 7200     # 2小时，风控失败后留出冷却时间
 SLIDER_VERIFICATION:
   max_concurrent: 3  # 滑块验证最大并发数
   wait_timeout: 60   # 等待排队超时时间（秒）

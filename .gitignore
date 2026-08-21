@@ -542,6 +542,7 @@ quick_*.py
 fix_*.py
 test_*.py
 !tests/test_manual_recovery.py
+!tests/test_cookie_refresh_safety.py
 check_*.py
 debug_*.py
 
